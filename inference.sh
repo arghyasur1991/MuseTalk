@@ -69,4 +69,4 @@ if [ "$mode" = "realtime" ]; then
 fi
 
 # Run inference
-python3 -m $script_name $cmd_args
+python -m $script_name $cmd_args
