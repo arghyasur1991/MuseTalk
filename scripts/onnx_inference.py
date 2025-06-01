@@ -129,15 +129,8 @@ class ONNXMuseTalkInference:
             {'image': image_tensor}
         )[0]
         
-        # The UNet expects 32x32 latents, so we need to resize if needed
-        expected_latent_size = 32
-        if latents.shape[2] != expected_latent_size or latents.shape[3] != expected_latent_size:
-            # Use torch to resize latents to expected dimensions
-            import torch.nn.functional as F
-            latents_torch = torch.from_numpy(latents)
-            latents_torch = F.interpolate(latents_torch, size=(expected_latent_size, expected_latent_size), mode='bilinear', align_corners=False)
-            latents = latents_torch.numpy()
-            print(f"Resized latents to {expected_latent_size}x{expected_latent_size} for UNet")
+        # VAE naturally produces 32x32 latents from 256x256 images - no resizing needed!
+        print(f"VAE encoder output shape: {latents.shape}")
         
         return latents
     
@@ -173,13 +166,8 @@ class ONNXMuseTalkInference:
             {'image': image_tensor}
         )[0]
         
-        # Resize if needed
-        expected_latent_size = 32
-        if latents.shape[2] != expected_latent_size or latents.shape[3] != expected_latent_size:
-            import torch.nn.functional as F
-            latents_torch = torch.from_numpy(latents)
-            latents_torch = F.interpolate(latents_torch, size=(expected_latent_size, expected_latent_size), mode='bilinear', align_corners=False)
-            latents = latents_torch.numpy()
+        # No resizing needed - VAE produces correct 32x32 latents
+        print(f"VAE encoder (masked) output shape: {latents.shape}")
         
         return latents
     
@@ -194,9 +182,9 @@ class ONNXMuseTalkInference:
         # Concatenate as in original implementation
         latent_model_input = np.concatenate([masked_latents, ref_latents], axis=1)
         
-        print(f"Masked latents shape: {masked_latents.shape}")
-        print(f"Ref latents shape: {ref_latents.shape}")
-        print(f"Combined latents shape: {latent_model_input.shape}")
+        # print(f"Masked latents shape: {masked_latents.shape}")
+        # print(f"Ref latents shape: {ref_latents.shape}")
+        # print(f"Combined latents shape: {latent_model_input.shape}")
         
         return latent_model_input
         
@@ -430,7 +418,7 @@ class ONNXMuseTalkInference:
                 
                 target_width = x2 - x1
                 target_height = y2 - y1
-                res_frame = cv2.resize(decoded_img.astype(np.uint8), (target_width, target_height))
+                res_frame = cv2.resize(decoded_img.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
                 
                 # Blend with original image (matching PyTorch)
                 ori_frame = frame_list[frame_idx % len(frame_list)].copy()
