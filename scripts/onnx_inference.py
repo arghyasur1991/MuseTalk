@@ -78,24 +78,13 @@ class ONNXMuseTalkInference:
         """Load all ONNX models"""
         print("Loading ONNX models...")
         
-        # Model file paths
+        # Model file paths - use regular optimized models
         model_suffix = f"_{self.version}" if self.version != "v1.0" else ""
         
-        unet_path = self.model_dir / f"unet{model_suffix}_hq.onnx"  # Use high-quality UNet
-        vae_encoder_path = self.model_dir / f"vae_encoder{model_suffix}_hq.onnx"  # Use high-quality
-        vae_decoder_path = self.model_dir / f"vae_decoder{model_suffix}_hq.onnx"  # Use high-quality
+        unet_path = self.model_dir / f"unet{model_suffix}.onnx"
+        vae_encoder_path = self.model_dir / f"vae_encoder{model_suffix}.onnx"
+        vae_decoder_path = self.model_dir / f"vae_decoder{model_suffix}.onnx"
         pe_path = self.model_dir / f"positional_encoding{model_suffix}.onnx"
-        
-        # Fallback to regular models if HQ models don't exist
-        if not unet_path.exists():
-            print("High-quality UNet not found, using regular version")
-            unet_path = self.model_dir / f"unet{model_suffix}.onnx"
-        if not vae_encoder_path.exists():
-            print("High-quality VAE encoder not found, using regular version")
-            vae_encoder_path = self.model_dir / f"vae_encoder{model_suffix}.onnx"
-        if not vae_decoder_path.exists():
-            print("High-quality VAE decoder not found, using regular version")
-            vae_decoder_path = self.model_dir / f"vae_decoder{model_suffix}.onnx"
         
         # Load models with error handling
         try:
