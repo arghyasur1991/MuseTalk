@@ -45,7 +45,7 @@ class ONNXMuseTalkInference:
         self.load_models()
         
     def _get_providers(self):
-        """Get available ONNX Runtime providers"""
+        """Get available ONNX Runtime providers with optimized settings"""
         providers = []
         
         # For large models like UNet, CoreML may fail, so prefer CPU for stability
@@ -59,6 +59,21 @@ class ONNXMuseTalkInference:
         print(f"Using ONNX providers: {providers}")
         return providers
         
+    def _get_session_options(self):
+        """Get optimized session options for higher precision"""
+        session_options = ort.SessionOptions()
+        
+        # Disable optimizations that might affect precision
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        
+        # Enable sequential execution for deterministic results
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        
+        # Set high precision mode
+        session_options.add_session_config_entry("session.use_env_allocators", "1")
+        
+        return session_options
+        
     def load_models(self):
         """Load all ONNX models"""
         print("Loading ONNX models...")
@@ -66,15 +81,26 @@ class ONNXMuseTalkInference:
         # Model file paths
         model_suffix = f"_{self.version}" if self.version != "v1.0" else ""
         
-        unet_path = self.model_dir / f"unet{model_suffix}.onnx"
-        vae_encoder_path = self.model_dir / f"vae_encoder{model_suffix}.onnx"
-        vae_decoder_path = self.model_dir / f"vae_decoder{model_suffix}.onnx"
+        unet_path = self.model_dir / f"unet{model_suffix}_hq.onnx"  # Use high-quality UNet
+        vae_encoder_path = self.model_dir / f"vae_encoder{model_suffix}_hq.onnx"  # Use high-quality
+        vae_decoder_path = self.model_dir / f"vae_decoder{model_suffix}_hq.onnx"  # Use high-quality
         pe_path = self.model_dir / f"positional_encoding{model_suffix}.onnx"
+        
+        # Fallback to regular models if HQ models don't exist
+        if not unet_path.exists():
+            print("High-quality UNet not found, using regular version")
+            unet_path = self.model_dir / f"unet{model_suffix}.onnx"
+        if not vae_encoder_path.exists():
+            print("High-quality VAE encoder not found, using regular version")
+            vae_encoder_path = self.model_dir / f"vae_encoder{model_suffix}.onnx"
+        if not vae_decoder_path.exists():
+            print("High-quality VAE decoder not found, using regular version")
+            vae_decoder_path = self.model_dir / f"vae_decoder{model_suffix}.onnx"
         
         # Load models with error handling
         try:
             print(f"Loading UNet from {unet_path}")
-            self.unet_session = ort.InferenceSession(str(unet_path), providers=self.providers)
+            self.unet_session = ort.InferenceSession(str(unet_path), providers=self.providers, session_options=self._get_session_options())
             print("✓ UNet loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load UNet: {e}")
@@ -82,7 +108,7 @@ class ONNXMuseTalkInference:
             
         try:
             print(f"Loading VAE Encoder from {vae_encoder_path}")
-            self.vae_encoder_session = ort.InferenceSession(str(vae_encoder_path), providers=self.providers)
+            self.vae_encoder_session = ort.InferenceSession(str(vae_encoder_path), providers=self.providers, session_options=self._get_session_options())
             print("✓ VAE Encoder loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load VAE Encoder: {e}")
@@ -90,7 +116,7 @@ class ONNXMuseTalkInference:
             
         try:
             print(f"Loading VAE Decoder from {vae_decoder_path}")
-            self.vae_decoder_session = ort.InferenceSession(str(vae_decoder_path), providers=self.providers)
+            self.vae_decoder_session = ort.InferenceSession(str(vae_decoder_path), providers=self.providers, session_options=self._get_session_options())
             print("✓ VAE Decoder loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load VAE Decoder: {e}")
@@ -98,7 +124,7 @@ class ONNXMuseTalkInference:
             
         try:
             print(f"Loading Positional Encoding from {pe_path}")
-            self.pe_session = ort.InferenceSession(str(pe_path), providers=self.providers)
+            self.pe_session = ort.InferenceSession(str(pe_path), providers=self.providers, session_options=self._get_session_options())
             print("✓ Positional Encoding loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load Positional Encoding: {e}")
@@ -186,28 +212,37 @@ class ONNXMuseTalkInference:
         return latent_model_input
         
     def decode_latents(self, latents, target_size=(256, 256)):
-        """Decode latents using VAE decoder - FIXED: proper normalization and color space"""
-        # Run VAE decoder
+        """Decode latents using VAE decoder - IMPROVED: Higher precision decoding"""
+        # Ensure input is float32 for maximum precision
+        if latents.dtype != np.float32:
+            latents = latents.astype(np.float32)
+        
+        # Run VAE decoder with precise session options
         image = self.vae_decoder_session.run(
             ['image'], 
             {'latents': latents}
         )[0]
         
-        # Convert back to uint8 image - FIXED: use correct normalization like PyTorch
+        # Convert back to uint8 image with improved precision
         image = np.transpose(image, (0, 2, 3, 1))
-        image = (image / 2 + 0.5).clip(0, 1)  # Correct normalization: (image / 2 + 0.5)
-        image = (image * 255).round().astype(np.uint8)
-        image = image[0]  # Remove batch dimension
+        
+        # Use higher precision for normalization to avoid rounding errors
+        image_float64 = image.astype(np.float64)
+        image_normalized = (image_float64 / 2.0 + 0.5).clip(0.0, 1.0)  # Higher precision
+        
+        # Convert to uint8 with proper rounding
+        image_uint8 = np.round(image_normalized * 255.0).astype(np.uint8)
+        image_final = image_uint8[0]  # Remove batch dimension
         
         # Keep as RGB - get_image function handles color conversion internally
-        # DO NOT convert RGB→BGR here as it causes confusion
         
-        # Resize to target size if specified
-        if target_size and (image.shape[0] != target_size[0] or image.shape[1] != target_size[1]):
-            image = cv2.resize(image, target_size)
-            print(f"Resized decoded image to {target_size}")
+        # Resize to target size with high-quality interpolation if specified
+        if target_size and (image_final.shape[0] != target_size[0] or image_final.shape[1] != target_size[1]):
+            # Use LANCZOS for high-quality resizing (same as PyTorch inference)
+            image_final = cv2.resize(image_final, target_size, interpolation=cv2.INTER_LANCZOS4)
+            print(f"Resized decoded image to {target_size} using LANCZOS4")
         
-        return image
+        return image_final
         
     def add_positional_encoding(self, audio_features):
         """Add positional encoding to audio features"""
