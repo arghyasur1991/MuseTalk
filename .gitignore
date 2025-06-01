@@ -16,3 +16,9 @@ ffplay*
 debug
 exp_out
 .gradio
+
+# Comparison folders
+comparison_frames/
+comparison_results/
+face_region_comparison/
+temp_comparison_imgs/

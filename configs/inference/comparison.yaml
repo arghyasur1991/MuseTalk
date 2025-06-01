@@ -1,0 +1,5 @@
+test:
+  video_path: "temp_comparison_imgs"
+  audio_path: "data/audio/yongen_1s.wav"
+  bbox_shift: 0
+  result_name: "pytorch_comparison.mp4" 
