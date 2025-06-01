@@ -225,10 +225,10 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     except Exception as e:
         print(f"Warning: Could not disable VAE attention optimizations: {e}")
     
-    # Create dummy input
+    # Create dummy input with dynamic dimensions
     batch_size = 1
     channels = 3
-    height, width = 256, 256
+    height, width = 512, 512  # Use larger base size for better compatibility
     
     dummy_input = torch.randn(batch_size, channels, height, width).to(device)
     
@@ -244,7 +244,7 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     
     encoder_wrapper = VAEEncoderWrapper(vae_model.vae).to(device)
     
-    # Export to ONNX with higher opset version
+    # Export to ONNX with dynamic axes for height and width
     torch.onnx.export(
         encoder_wrapper,
         dummy_input,
@@ -255,8 +255,8 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
         input_names=['image'],
         output_names=['latents'],
         dynamic_axes={
-            'image': {0: 'batch_size'},
-            'latents': {0: 'batch_size'}
+            'image': {0: 'batch_size', 2: 'height', 3: 'width'},
+            'latents': {0: 'batch_size', 2: 'latent_height', 3: 'latent_width'}
         },
         verbose=False,
         training=torch.onnx.TrainingMode.EVAL
@@ -287,10 +287,10 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     except Exception as e:
         print(f"Warning: Could not disable VAE attention optimizations: {e}")
     
-    # Create dummy input
+    # Create dummy input with dynamic dimensions
     batch_size = 1
     latent_channels = 4
-    latent_height, latent_width = 32, 32
+    latent_height, latent_width = 64, 64  # Use larger base size for better compatibility
     
     dummy_latents = torch.randn(batch_size, latent_channels, latent_height, latent_width).to(device)
     
@@ -306,7 +306,7 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     
     decoder_wrapper = VAEDecoderWrapper(vae_model.vae).to(device)
     
-    # Export to ONNX with higher opset version
+    # Export to ONNX with dynamic axes for latent dimensions
     torch.onnx.export(
         decoder_wrapper,
         dummy_latents,
@@ -317,8 +317,8 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
         input_names=['latents'],
         output_names=['image'],
         dynamic_axes={
-            'latents': {0: 'batch_size'},
-            'image': {0: 'batch_size'}
+            'latents': {0: 'batch_size', 2: 'latent_height', 3: 'latent_width'},
+            'image': {0: 'batch_size', 2: 'height', 3: 'width'}
         },
         verbose=False,
         training=torch.onnx.TrainingMode.EVAL

@@ -172,12 +172,13 @@ class ONNXMuseTalkInference:
             # Return zeros as fallback
             return np.zeros_like(input_latents[:, :4])  # Return only first 4 channels
             
-    def inference(self, avatar_path, audio_path, output_path, batch_size=4):
+    def inference(self, avatar_path, audio_path, output_path, batch_size=4, max_images=10):
         """Run complete inference pipeline"""
         print(f"Starting ONNX inference...")
         print(f"Avatar: {avatar_path}")
         print(f"Audio: {audio_path}")
         print(f"Output: {output_path}")
+        print(f"Max images for debugging: {max_images}")
         
         start_time = time.time()
         
@@ -190,6 +191,11 @@ class ONNXMuseTalkInference:
             for ext in image_extensions:
                 img_path_list.extend(glob.glob(os.path.join(avatar_path, ext)))
             img_path_list = sorted(img_path_list)
+            
+            # Use only a subset for debugging
+            if max_images > 0 and len(img_path_list) > max_images:
+                img_path_list = img_path_list[:max_images]
+                print(f"Using first {max_images} images for faster debugging")
         else:
             # Single image file
             img_path_list = [avatar_path]
@@ -323,6 +329,7 @@ def main():
     parser.add_argument("--version", default="v15", help="Model version")
     parser.add_argument("--device", default="cpu", help="Device (cpu/cuda)")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--max_images", type=int, default=10, help="Max images for debugging (0 for all)")
     
     args = parser.parse_args()
     
@@ -338,7 +345,8 @@ def main():
         avatar_path=args.avatar_path,
         audio_path=args.audio_path,
         output_path=args.output_path,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        max_images=args.max_images
     )
 
 if __name__ == "__main__":
