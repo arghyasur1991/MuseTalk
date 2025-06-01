@@ -133,20 +133,29 @@ class ONNXMuseTalkInference:
         print("All ONNX models loaded successfully!")
         
     def encode_image(self, image):
-        """Encode image using VAE encoder - FIXED: match PyTorch normalization"""
+        """Encode image using VAE encoder - FIXED: match PyTorch VAE preprocessing exactly"""
         # Resize image to expected VAE input size (256x256 for the exported model)
         target_size = 256
         if image.shape[0] != target_size or image.shape[1] != target_size:
             image = cv2.resize(image, (target_size, target_size))
         
-        # Normalize like PyTorch VAE: first to [0,1], then transform (x - 0.5) / 0.5 = 2*x - 1
-        image_normalized = image.astype(np.float32) / 255.0
-        image_tensor = 2.0 * image_normalized - 1.0
+        # FIXED: Match PyTorch VAE preprocessing order EXACTLY
+        # Step 1: Keep as BGR (skip BGR->RGB conversion as it's handled internally)
         
-        # Add batch dimension and transpose to NCHW
-        if len(image_tensor.shape) == 3:
-            image_tensor = np.expand_dims(image_tensor, 0)
-        image_tensor = np.transpose(image_tensor, (0, 3, 1, 2))
+        # Step 2: Create window and normalize to [0,1]
+        window = [image]  # Use image directly without BGR->RGB conversion
+        x = np.asarray(window, dtype=np.float32) / 255.0
+        
+        # Step 3: Transpose to get [C, B, H, W] then squeeze to [C, H, W]
+        x = np.transpose(x, (3, 0, 1, 2))  # [C, B, H, W]
+        x = np.squeeze(x)  # [C, H, W]
+        
+        # Step 4: Apply normalization transform: (x - 0.5) / 0.5
+        for c in range(3):
+            x[c] = (x[c] - 0.5) / 0.5
+        
+        # Step 5: Add batch dimension for ONNX: [1, C, H, W]
+        image_tensor = np.expand_dims(x, 0)
         
         # Run VAE encoder
         latents = self.vae_encoder_session.run(
@@ -154,43 +163,45 @@ class ONNXMuseTalkInference:
             {'image': image_tensor}
         )[0]
         
-        # No resizing needed - VAE produces correct 32x32 latents
-        
         return latents
     
     def encode_image_with_half_mask(self, image):
-        """Encode image with lower half masked (like get_latents_for_unet) - FIXED: zero out lower half"""
+        """Encode image with lower half masked - FIXED: match PyTorch VAE exactly"""
         # Resize image to expected VAE input size
         target_size = 256
         if image.shape[0] != target_size or image.shape[1] != target_size:
             image = cv2.resize(image, (target_size, target_size))
         
-        # Normalize image to [0, 1] first (like PyTorch)
-        image_normalized = image.astype(np.float32) / 255.0
+        # FIXED: Match PyTorch VAE preprocessing order EXACTLY  
+        # Step 1: Keep as BGR (skip BGR->RGB conversion as it's handled internally)
         
-        # Apply half mask - ZERO OUT lower half (like PyTorch VAE)
-        mask = np.ones((target_size, target_size), dtype=np.float32)
-        mask[target_size//2:, :] = 0  # Set lower half to 0 (matching PyTorch)
+        # Step 2: Create window and normalize to [0,1]
+        window = [image]  # Use image directly without BGR->RGB conversion
+        x = np.asarray(window, dtype=np.float32) / 255.0
         
-        # Apply mask to all channels
+        # Step 3: Transpose to get [C, B, H, W] then squeeze to [C, H, W]
+        x = np.transpose(x, (3, 0, 1, 2))  # [C, B, H, W]
+        x = np.squeeze(x)  # [C, H, W]
+        
+        # Step 4: Apply mask first (before normalization transform)
+        mask_tensor = np.zeros((target_size, target_size), dtype=np.float32)
+        mask_tensor[:target_size//2, :] = 1  # Upper half = 1, lower half = 0
+        # Apply mask to each channel of [C, H, W] tensor
         for c in range(3):
-            image_normalized[:, :, c] *= mask
+            x[c] = x[c] * mask_tensor
         
-        # Now apply the transform normalization: (x - 0.5) / 0.5 = 2*x - 1
-        image_tensor = 2.0 * image_normalized - 1.0
+        # Step 5: Apply normalization transform: (x - 0.5) / 0.5
+        for c in range(3):
+            x[c] = (x[c] - 0.5) / 0.5
         
-        # Add batch dimension and transpose to NCHW
-        if len(image_tensor.shape) == 3:
-            image_tensor = np.expand_dims(image_tensor, 0)
-        image_tensor = np.transpose(image_tensor, (0, 3, 1, 2))
+        # Step 6: Add batch dimension for ONNX: [1, C, H, W]
+        image_tensor = np.expand_dims(x, 0)
         
         # Run VAE encoder
         latents = self.vae_encoder_session.run(
             ['latents'], 
             {'image': image_tensor}
         )[0]
-        
-        # No resizing needed - VAE produces correct 32x32 latents
         
         return latents
     

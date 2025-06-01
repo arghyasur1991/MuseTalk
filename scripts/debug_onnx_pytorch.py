@@ -62,38 +62,86 @@ def debug_pytorch_vs_onnx():
     # === STEP 1: VAE Encoding ===
     print("\n=== STEP 1: VAE Encoding ===")
     
-    # PyTorch VAE encoding
-    pytorch_latents = vae.get_latents_for_unet(crop_frame)
-    print(f"PyTorch latents shape: {pytorch_latents.shape}")
-    print(f"PyTorch latents range: [{pytorch_latents.min():.6f}, {pytorch_latents.max():.6f}]")
+    # Test PyTorch VAE with both sample() and mode() for comparison
+    print("\n--- Testing PyTorch VAE: sample() vs mode() ---")
+    
+    # Encode using original sample() method
+    pytorch_latents_sample = vae.get_latents_for_unet(crop_frame)
+    print(f"PyTorch latents (sample): {pytorch_latents_sample.shape}, range: [{pytorch_latents_sample.min():.6f}, {pytorch_latents_sample.max():.6f}]")
+    
+    # Manually test with mode() to see if this reduces differences
+    ref_image_masked = vae.preprocess_img(crop_frame, half_mask=True)
+    ref_image_full = vae.preprocess_img(crop_frame, half_mask=False)
+    
+    with torch.no_grad():
+        # Test with mode() instead of sample()
+        masked_latent_dist = vae.vae.encode(ref_image_masked.to(vae.vae.dtype)).latent_dist
+        ref_latent_dist = vae.vae.encode(ref_image_full.to(vae.vae.dtype)).latent_dist
+        
+        masked_latents_mode = vae.scaling_factor * masked_latent_dist.mode()
+        ref_latents_mode = vae.scaling_factor * ref_latent_dist.mode()
+        pytorch_latents_mode = torch.cat([masked_latents_mode, ref_latents_mode], dim=1)
+    
+    print(f"PyTorch latents (mode): {pytorch_latents_mode.shape}, range: [{pytorch_latents_mode.min():.6f}, {pytorch_latents_mode.max():.6f}]")
+    
+    # Compare sample() vs mode() in PyTorch
+    mode_sample_diff = torch.abs(pytorch_latents_sample - pytorch_latents_mode)
+    print(f"PyTorch sample() vs mode() MAE: {torch.mean(mode_sample_diff):.6f}")
+    print(f"PyTorch sample() vs mode() Max Diff: {torch.max(mode_sample_diff):.6f}")
     
     # ONNX VAE encoding (matching the ONNX inference exactly)
-    # Half-masked image
+    # Half-masked image - FIXED: Use corrected preprocessing order
     image_normalized = crop_frame.astype(np.float32) / 255.0
-    mask = np.ones((256, 256), dtype=np.float32)
-    mask[256//2:, :] = 0  # Set lower half to 0
-    for c in range(3):
-        image_normalized[:, :, c] *= mask
-    image_tensor_masked = 2.0 * image_normalized - 1.0
-    image_tensor_masked = np.expand_dims(np.transpose(image_tensor_masked, (2, 0, 1)), 0)
+    image_tensor_masked = np.transpose(image_normalized, (2, 0, 1))  # [C, H, W]
     
-    # Full image
+    # Apply mask to [C, H, W] tensor (same as PyTorch)
+    mask_tensor = np.zeros((256, 256), dtype=np.float32)
+    mask_tensor[:256//2, :] = 1  # Upper half = 1, lower half = 0
+    for c in range(3):
+        image_tensor_masked[c] = image_tensor_masked[c] * mask_tensor
+    
+    # Apply normalization per channel
+    for c in range(3):
+        image_tensor_masked[c] = (image_tensor_masked[c] - 0.5) / 0.5
+    
+    # Add batch dimension
+    image_tensor_masked = np.expand_dims(image_tensor_masked, 0)
+    
+    # Full image - FIXED: Use corrected preprocessing order
     image_normalized_full = crop_frame.astype(np.float32) / 255.0
-    image_tensor_full = 2.0 * image_normalized_full - 1.0
-    image_tensor_full = np.expand_dims(np.transpose(image_tensor_full, (2, 0, 1)), 0)
+    image_tensor_full = np.transpose(image_normalized_full, (2, 0, 1))  # [C, H, W]
+    
+    # Apply normalization per channel
+    for c in range(3):
+        image_tensor_full[c] = (image_tensor_full[c] - 0.5) / 0.5
+    
+    # Add batch dimension
+    image_tensor_full = np.expand_dims(image_tensor_full, 0)
     
     # ONNX VAE encoding
     masked_latents = vae_encoder_session.run(['latents'], {'image': image_tensor_masked})[0]
     ref_latents = vae_encoder_session.run(['latents'], {'image': image_tensor_full})[0]
     onnx_latents = np.concatenate([masked_latents, ref_latents], axis=1)
     
-    print(f"ONNX latents shape: {onnx_latents.shape}")
+    print(f"\nONNX latents shape: {onnx_latents.shape}")
     print(f"ONNX latents range: [{onnx_latents.min():.6f}, {onnx_latents.max():.6f}]")
     
-    # Compare latents
-    latent_diff = np.abs(pytorch_latents.detach().numpy() - onnx_latents)
-    print(f"Latent MAE: {np.mean(latent_diff):.6f}")
-    print(f"Latent Max Diff: {np.max(latent_diff):.6f}")
+    # Compare PyTorch sample() vs ONNX
+    latent_diff_sample = np.abs(pytorch_latents_sample.detach().numpy() - onnx_latents)
+    print(f"\nPyTorch sample() vs ONNX MAE: {np.mean(latent_diff_sample):.6f}")
+    print(f"PyTorch sample() vs ONNX Max Diff: {np.max(latent_diff_sample):.6f}")
+    
+    # Compare PyTorch mode() vs ONNX (should be much closer!)
+    latent_diff_mode = np.abs(pytorch_latents_mode.detach().numpy() - onnx_latents)
+    print(f"PyTorch mode() vs ONNX MAE: {np.mean(latent_diff_mode):.6f}")
+    print(f"PyTorch mode() vs ONNX Max Diff: {np.max(latent_diff_mode):.6f}")
+    
+    if np.mean(latent_diff_mode) < np.mean(latent_diff_sample) / 2:
+        print("✅ Using mode() significantly reduces VAE encoding differences!")
+        use_mode_latents = pytorch_latents_mode
+    else:
+        print("⚠️ Mode vs sample difference doesn't explain the issue")
+        use_mode_latents = pytorch_latents_sample
     
     # === STEP 2: UNet Processing ===
     print("\n=== STEP 2: UNet Processing ===")
@@ -112,10 +160,10 @@ def debug_pytorch_vs_onnx():
     timesteps = torch.tensor([0], dtype=torch.long, device=device)
     timesteps_np = np.array([0], dtype=np.int64)
     
-    # PyTorch UNet
+    # PyTorch UNet (use the latents that matched better)
     with torch.no_grad():
         pytorch_unet_out = unet.model(
-            sample=pytorch_latents,
+            sample=use_mode_latents,
             timestep=timesteps,
             encoder_hidden_states=pytorch_audio,
             return_dict=False

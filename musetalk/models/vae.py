@@ -12,13 +12,14 @@ class VAE():
     VAE (Variational Autoencoder) class for image processing.
     """
 
-    def __init__(self, model_path="./models/sd-vae-ft-mse/", resized_img=256, use_float16=False):
+    def __init__(self, model_path="./models/sd-vae-ft-mse/", resized_img=256, use_float16=False, deterministic=False):
         """
         Initialize the VAE instance.
 
         :param model_path: Path to the trained model.
         :param resized_img: The size to which images are resized.
         :param use_float16: Whether to use float16 precision.
+        :param deterministic: Whether to use deterministic encoding (mode) instead of stochastic (sample)
         """
         self.model_path = model_path
         self.vae = AutoencoderKL.from_pretrained(self.model_path)
@@ -36,6 +37,7 @@ class VAE():
         self.transform = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         self._resized_img = resized_img
         self._mask_tensor = self.get_mask_tensor()
+        self._deterministic = deterministic  # For ONNX compatibility
         
     def get_mask_tensor(self):
         """
@@ -90,7 +92,14 @@ class VAE():
         """
         with torch.no_grad():
             init_latent_dist = self.vae.encode(image.to(self.vae.dtype)).latent_dist
-        init_latents = self.scaling_factor * init_latent_dist.sample()
+        
+        if self._deterministic:
+            # Use mode() for deterministic results (ONNX compatibility)
+            init_latents = self.scaling_factor * init_latent_dist.mode()
+        else:
+            # Use sample() for stochastic results (original behavior)
+            init_latents = self.scaling_factor * init_latent_dist.sample()
+            
         return init_latents
     
     def decode_latents(self, latents):

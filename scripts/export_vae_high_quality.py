@@ -169,7 +169,9 @@ def export_vae_encoder_high_quality(vae_model, output_path, device="cpu", opset_
         def forward(self, x):
             with torch.no_grad():
                 latent_dist = self.vae.encode(x).latent_dist
-                # Use mode() for deterministic results (matching PyTorch VAE.encode_latents)
+                # NOTE: PyTorch VAE uses sample() but this is stochastic and varies each run
+                # For ONNX deterministic inference, we use mode() which is the mean of the distribution
+                # This causes quality differences but ensures reproducible results
                 return latent_dist.mode() * self.vae.config.scaling_factor
     
     encoder_wrapper = VAEEncoderHighQualityWrapper(vae_model.vae).to(device)
