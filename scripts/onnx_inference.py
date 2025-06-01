@@ -140,10 +140,11 @@ class ONNXMuseTalkInference:
             image = cv2.resize(image, (target_size, target_size))
         
         # FIXED: Match PyTorch VAE preprocessing order EXACTLY
-        # Step 1: Keep as BGR (skip BGR->RGB conversion as it's handled internally)
+        # Step 1: BGR to RGB conversion (PyTorch VAE does this!)
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         # Step 2: Create window and normalize to [0,1]
-        window = [image]  # Use image directly without BGR->RGB conversion
+        window = [img_rgb]
         x = np.asarray(window, dtype=np.float32) / 255.0
         
         # Step 3: Transpose to get [C, B, H, W] then squeeze to [C, H, W]
@@ -173,10 +174,11 @@ class ONNXMuseTalkInference:
             image = cv2.resize(image, (target_size, target_size))
         
         # FIXED: Match PyTorch VAE preprocessing order EXACTLY  
-        # Step 1: Keep as BGR (skip BGR->RGB conversion as it's handled internally)
+        # Step 1: BGR to RGB conversion (PyTorch VAE does this!)
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         # Step 2: Create window and normalize to [0,1]
-        window = [image]  # Use image directly without BGR->RGB conversion
+        window = [img_rgb]
         x = np.asarray(window, dtype=np.float32) / 255.0
         
         # Step 3: Transpose to get [C, B, H, W] then squeeze to [C, H, W]
@@ -245,15 +247,17 @@ class ONNXMuseTalkInference:
         image_uint8 = np.round(image_normalized * 255.0).astype(np.uint8)
         image_final = image_uint8[0]  # Remove batch dimension
         
-        # Keep as RGB - get_image function handles color conversion internally
+        # FIXED: Convert RGB to BGR to match PyTorch VAE decode_latents exactly
+        # PyTorch VAE does: image = image[...,::-1] # RGB to BGR
+        image_final_bgr = image_final[...,::-1]  # RGB to BGR conversion
         
         # Resize to target size with high-quality interpolation if specified
-        if target_size and (image_final.shape[0] != target_size[0] or image_final.shape[1] != target_size[1]):
+        if target_size and (image_final_bgr.shape[0] != target_size[0] or image_final_bgr.shape[1] != target_size[1]):
             # Use LANCZOS for high-quality resizing (same as PyTorch inference)
-            image_final = cv2.resize(image_final, target_size, interpolation=cv2.INTER_LANCZOS4)
+            image_final_bgr = cv2.resize(image_final_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
             print(f"Resized decoded image to {target_size} using LANCZOS4")
         
-        return image_final
+        return image_final_bgr
         
     def add_positional_encoding(self, audio_features):
         """Add positional encoding to audio features"""
