@@ -157,21 +157,16 @@ class ONNXMuseTalkInference:
         
     def run_unet(self, input_latents, timesteps, audio_prompts):
         """Run UNet denoising"""
-        try:
-            noise_prediction = self.unet_session.run(
-                ['noise_prediction'],
-                {
-                    'input_latents': input_latents,
-                    'timesteps': timesteps,
-                    'audio_prompts': audio_prompts
-                }
-            )[0]
-            return noise_prediction
-        except Exception as e:
-            print(f"UNet inference failed: {e}")
-            # Return zeros as fallback
-            return np.zeros_like(input_latents[:, :4])  # Return only first 4 channels
-            
+        noise_prediction = self.unet_session.run(
+            ['noise_prediction'],
+            {
+                'input_latents': input_latents,
+                'timesteps': timesteps,
+                'audio_prompts': audio_prompts
+            }
+        )[0]
+        return noise_prediction
+        
     def inference(self, avatar_path, audio_path, output_path, batch_size=4, max_images=10):
         """Run complete inference pipeline"""
         print(f"Starting ONNX inference...")
@@ -232,65 +227,53 @@ class ONNXMuseTalkInference:
             
             print(f"Processing frames {i}-{batch_end-1}")
             
-            try:
-                # Get reference image (cycle through available images)
-                ref_img_idx = i % len(ori_imgs)
-                ref_img = ori_imgs[ref_img_idx]
+            # Get reference image (cycle through available images)
+            ref_img_idx = i % len(ori_imgs)
+            ref_img = ori_imgs[ref_img_idx]
+            
+            # Encode reference image
+            ref_latents = self.encode_image(ref_img)
+            
+            # Prepare batch inputs
+            batch_latents = np.repeat(ref_latents, batch_size_actual, axis=0)
+            
+            # Create noise latents (same shape as ref_latents)
+            noise_latents = np.random.randn(*batch_latents.shape).astype(np.float32)
+            
+            # Concatenate reference and noise latents
+            input_latents = np.concatenate([batch_latents, noise_latents], axis=1)
+            
+            # Prepare timesteps
+            timesteps = np.array([0] * batch_size_actual, dtype=np.int64)
+            
+            # Get audio features for this batch
+            batch_audio = audio_features_pe[:, i:batch_end, :]
+            if batch_audio.shape[1] < batch_size_actual:
+                # Pad if needed
+                padding = np.zeros((1, batch_size_actual - batch_audio.shape[1], 384), dtype=np.float32)
+                batch_audio = np.concatenate([batch_audio, padding], axis=1)
+            
+            # Repeat for batch
+            batch_audio = np.repeat(batch_audio, batch_size_actual, axis=0)
+            
+            # Run UNet - fail fast on error
+            noise_pred = self.run_unet(input_latents, timesteps, batch_audio)
+            
+            # Simple denoising (subtract predicted noise)
+            denoised_latents = batch_latents - noise_pred
+            
+            # Decode latents to images
+            for j in range(batch_size_actual):
+                frame_latents = denoised_latents[j:j+1]
+                decoded_img = self.decode_latents(frame_latents)
                 
-                # Encode reference image
-                ref_latents = self.encode_image(ref_img)
+                # Blend with original image using bbox
+                final_img = get_image(ori_imgs[ref_img_idx], decoded_img, bbox)
+                generated_frames.append(final_img)
                 
-                # Prepare batch inputs
-                batch_latents = np.repeat(ref_latents, batch_size_actual, axis=0)
-                
-                # Create noise latents (same shape as ref_latents)
-                noise_latents = np.random.randn(*batch_latents.shape).astype(np.float32)
-                
-                # Concatenate reference and noise latents
-                input_latents = np.concatenate([batch_latents, noise_latents], axis=1)
-                
-                # Prepare timesteps
-                timesteps = np.array([0] * batch_size_actual, dtype=np.int64)
-                
-                # Get audio features for this batch
-                batch_audio = audio_features_pe[:, i:batch_end, :]
-                if batch_audio.shape[1] < batch_size_actual:
-                    # Pad if needed
-                    padding = np.zeros((1, batch_size_actual - batch_audio.shape[1], 384), dtype=np.float32)
-                    batch_audio = np.concatenate([batch_audio, padding], axis=1)
-                
-                # Repeat for batch
-                batch_audio = np.repeat(batch_audio, batch_size_actual, axis=0)
-                
-                # Run UNet
-                noise_pred = self.run_unet(input_latents, timesteps, batch_audio)
-                
-                # Simple denoising (subtract predicted noise)
-                denoised_latents = batch_latents - noise_pred
-                
-                # Decode latents to images
-                for j in range(batch_size_actual):
-                    frame_latents = denoised_latents[j:j+1]
-                    decoded_img = self.decode_latents(frame_latents)
-                    
-                    # Blend with original image using bbox
-                    final_img = get_image(ori_imgs[ref_img_idx], decoded_img, bbox)
-                    generated_frames.append(final_img)
-                    
-                    # Save frame
-                    frame_path = os.path.join(output_path, f"frame_{i+j:06d}.png")
-                    cv2.imwrite(frame_path, final_img)
-                    
-            except Exception as e:
-                print(f"Error processing batch {i}-{batch_end-1}: {e}")
-                # Use fallback - just copy reference image
-                for j in range(batch_size_actual):
-                    ref_img_idx = (i + j) % len(ori_imgs)
-                    fallback_img = ori_imgs[ref_img_idx]
-                    generated_frames.append(fallback_img)
-                    
-                    frame_path = os.path.join(output_path, f"frame_{i+j:06d}.png")
-                    cv2.imwrite(frame_path, fallback_img)
+                # Save frame
+                frame_path = os.path.join(output_path, f"frame_{i+j:06d}.png")
+                cv2.imwrite(frame_path, final_img)
         
         # Create video from frames
         self.create_video(output_path, generated_frames, fps=25)
