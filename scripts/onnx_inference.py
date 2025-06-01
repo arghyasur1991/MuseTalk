@@ -201,7 +201,7 @@ class ONNXMuseTalkInference:
         return latent_model_input
         
     def decode_latents(self, latents, target_size=(256, 256)):
-        """Decode latents using VAE decoder - FIXED: proper normalization"""
+        """Decode latents using VAE decoder - FIXED: proper normalization and color space"""
         # Run VAE decoder
         image = self.vae_decoder_session.run(
             ['image'], 
@@ -214,8 +214,8 @@ class ONNXMuseTalkInference:
         image = (image * 255).round().astype(np.uint8)
         image = image[0]  # Remove batch dimension
         
-        # Convert RGB to BGR like PyTorch VAE
-        image = image[..., ::-1]
+        # Keep as RGB - get_image function handles color conversion internally
+        # DO NOT convert RGB→BGR here as it causes confusion
         
         # Resize to target size if specified
         if target_size and (image.shape[0] != target_size[0] or image.shape[1] != target_size[1]):
@@ -446,31 +446,46 @@ class ONNXMuseTalkInference:
                 cv2.imwrite(frame_path, combine_frame)
         
         # Create video from frames
-        self.create_video(output_path, res_frame_list, fps=25)
+        self.create_video(output_path, res_frame_list, fps=25, audio_path=audio_path)
         
         end_time = time.time()
         print(f"Inference completed in {end_time - start_time:.2f} seconds")
         print(f"Generated {len(res_frame_list)} frames")
         
-    def create_video(self, output_dir, frames, fps=25):
-        """Create video from generated frames"""
+    def create_video(self, output_dir, frames, fps=25, audio_path=None):
+        """Create video from generated frames and add audio"""
         if not frames:
             print("No frames to create video")
             return
             
         output_video = os.path.join(output_dir, "output.mp4")
+        temp_video = os.path.join(output_dir, "temp_video.mp4")
         
         # Get frame dimensions
         height, width = frames[0].shape[:2]
         
-        # Create video writer
+        # Create video writer for temporary video without audio
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+        out = cv2.VideoWriter(temp_video, fourcc, fps, (width, height))
         
         for frame in frames:
             out.write(frame)
             
         out.release()
+        
+        # Add audio if provided
+        if audio_path and os.path.exists(audio_path):
+            print(f"Adding audio from {audio_path}")
+            cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {temp_video} {output_video}"
+            print(f"Audio combination command: {cmd_combine_audio}")
+            os.system(cmd_combine_audio)
+            
+            # Clean up temporary video
+            os.remove(temp_video)
+        else:
+            # No audio, just rename temp video
+            os.rename(temp_video, output_video)
+        
         print(f"Video saved to: {output_video}")
 
 def main():
