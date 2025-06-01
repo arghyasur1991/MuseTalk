@@ -112,7 +112,6 @@ class ONNXMuseTalkInference:
         target_size = 256
         if image.shape[0] != target_size or image.shape[1] != target_size:
             image = cv2.resize(image, (target_size, target_size))
-            print(f"Resized image to {target_size}x{target_size} for VAE encoder")
         
         # Normalize like PyTorch VAE: first to [0,1], then transform (x - 0.5) / 0.5 = 2*x - 1
         image_normalized = image.astype(np.float32) / 255.0
@@ -129,8 +128,7 @@ class ONNXMuseTalkInference:
             {'image': image_tensor}
         )[0]
         
-        # VAE naturally produces 32x32 latents from 256x256 images - no resizing needed!
-        print(f"VAE encoder output shape: {latents.shape}")
+        # No resizing needed - VAE produces correct 32x32 latents
         
         return latents
     
@@ -167,7 +165,6 @@ class ONNXMuseTalkInference:
         )[0]
         
         # No resizing needed - VAE produces correct 32x32 latents
-        print(f"VAE encoder (masked) output shape: {latents.shape}")
         
         return latents
     
@@ -382,23 +379,14 @@ class ONNXMuseTalkInference:
                 whisper_batch = np.stack(whisper_batch)  # [batch_size, 50, 384]
             latent_batch = np.concatenate(latent_batch, axis=0)  # [batch_size, 8, 32, 32]
             
-            print(f"Whisper batch shape: {whisper_batch.shape}")
-            print(f"Latent batch shape: {latent_batch.shape}")
-            
             # Apply positional encoding to audio (matching PyTorch)
             audio_feature_batch = self.add_positional_encoding(whisper_batch)
-            print(f"Audio features with PE shape: {audio_feature_batch.shape}")
             
             # Prepare timesteps
             batch_timesteps = np.repeat(timesteps, batch_size_actual)
             
             # Run UNet inference
             pred_latents = self.run_unet(latent_batch, batch_timesteps, audio_feature_batch)
-            print(f"Predicted latents shape: {pred_latents.shape}")
-            
-            # NOTE: Do NOT apply scaling factor division here - the ONNX VAE decoder already handles it internally!
-            # The VAE decoder wrapper divides by scaling_factor before calling decode()
-            print(f"Pred latents min: {pred_latents.min():.3f}, max: {pred_latents.max():.3f}")
             
             # Decode latents to images (matching PyTorch)
             for j in range(batch_size_actual):
@@ -406,7 +394,6 @@ class ONNXMuseTalkInference:
                 
                 # Decode using VAE decoder
                 decoded_img = self.decode_latents(frame_latents, target_size=None)  # Let it be natural size
-                print(f"Decoded image shape: {decoded_img.shape}")
                 
                 # Resize to face crop size (matching PyTorch)
                 frame_idx = start_idx + j

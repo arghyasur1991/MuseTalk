@@ -240,7 +240,9 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
             
         def forward(self, x):
             latent_dist = self.vae.encode(x).latent_dist
-            return latent_dist.sample() * self.vae.config.scaling_factor
+            # Use mode() for deterministic results (matching PyTorch VAE.encode_latents)
+            # instead of sample() which adds stochastic noise
+            return latent_dist.mode() * self.vae.config.scaling_factor
     
     encoder_wrapper = VAEEncoderWrapper(vae_model.vae).to(device)
     
