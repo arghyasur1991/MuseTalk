@@ -39,15 +39,12 @@ class ONNXMuseTalkInference:
         """Get available ONNX Runtime providers"""
         providers = []
         
-        # Check for CoreML (Mac ARM optimization)
-        if 'CoreMLExecutionProvider' in ort.get_available_providers():
-            providers.append('CoreMLExecutionProvider')
-            
-        # Check for CUDA
+        # For large models like UNet, CoreML may fail, so prefer CPU for stability
+        # Check for CUDA first if requested
         if 'CUDAExecutionProvider' in ort.get_available_providers() and self.device == "cuda":
             providers.append('CUDAExecutionProvider')
             
-        # Always add CPU as fallback
+        # Always add CPU as it's most compatible
         providers.append('CPUExecutionProvider')
         
         print(f"Using ONNX providers: {providers}")
