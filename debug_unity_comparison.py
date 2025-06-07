@@ -12,13 +12,21 @@ import json
 from pathlib import Path
 import librosa
 import argparse
+import torch
+import onnxruntime as ort
+import time
+import glob
+import copy
+from scripts.onnx_inference import ONNXMuseTalkInference
 
-# Add the project root to Python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add the parent directory to the path to make imports work
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from musetalk.utils.preprocessing import get_landmark_and_bbox, coord_placeholder
+from musetalk.utils.preprocessing import get_landmark_and_bbox, coord_placeholder, read_imgs
 from musetalk.utils.audio_processor import AudioProcessor
 import math
+from musetalk.utils.face_parsing import FaceParsing
+from musetalk.utils.blending import get_image
 
 class UnityPythonDebugger:
     def __init__(self, output_dir="debug_unity_comparison"):
@@ -273,33 +281,157 @@ class UnityPythonDebugger:
         print(f"Debug output saved to: {self.output_dir}")
         print(f"\nCompare with Unity debug output folder!")
 
+def ensure_dir(path):
+    """Ensure the directory exists."""
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def save_tensor(tensor, name, output_dir):
+    """Save a numpy tensor to a file."""
+    np.save(Path(output_dir) / f"{name}.npy", tensor)
+    print(f"Saved tensor '{name}' with shape {tensor.shape} and dtype {tensor.dtype}")
+
+def save_image(image, name, output_dir):
+    """Save an image (numpy array in BGR format) to a file."""
+    cv2.imwrite(str(Path(output_dir) / f"{name}.png"), image)
+    print(f"Saved image '{name}' with shape {image.shape}")
+
+def save_json(data, name, output_dir):
+    """Save data to a JSON file."""
+    with open(Path(output_dir) / f"{name}.json", 'w') as f:
+        json.dump(data, f, indent=4)
+    print(f"Saved JSON data '{name}'")
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate Unity-compatible Python debug outputs for MuseTalk")
-    parser.add_argument("--image", default="results/v15/avatars/avator_1/full_imgs/00000000.png", 
-                       help="Path to avatar image")
-    parser.add_argument("--audio", default=None, 
-                       help="Path to audio file")
-    parser.add_argument("--duration", type=float, default=None,
-                       help="Audio duration in seconds (if not loading from file)")
+    """
+    Run a single-frame inference and dump all intermediate data for Unity comparison.
+    """
+    # --- Configuration ---
+    # Get the root directory of the project (assuming this script is in MuseTalk/)
+    project_root = Path(__file__).resolve().parent.parent
     
-    args = parser.parse_args()
+    output_dir = project_root / "MuseTalk" / "debug_unity_comparison"
+    ensure_dir(output_dir)
+
+    # Paths are now built from the project root, which is more robust
+    avatar_path = project_root / "MysteryAI" / "Assets" / "Resources" / "00000000.png"
+    audio_path = project_root / "MysteryAI" / "Assets" / "Resources" / "audio" / "detective_1s.wav"
+
+    if not avatar_path.exists() or not audio_path.exists():
+        print("User-specified assets not found, using MuseTalk assets as fallback.")
+        avatar_path = project_root / "MuseTalk" / "assets" / "demo" / "monalisa" / "00000000.png"
+        audio_path = project_root / "MuseTalk" / "assets" / "demo" / "monalisa" / "aud.wav"
+
+    # Convert path objects to strings for legacy functions
+    avatar_path = str(avatar_path)
+    audio_path = str(audio_path)
+
+    result_dir = output_dir / "results"
+    ensure_dir(result_dir)
+
+    # All model paths are relative to the MuseTalk folder.
+    # We no longer cd into it, instead we build absolute paths for them.
+    musetalk_dir = project_root / "MuseTalk"
+    model_dir = musetalk_dir / "models" / "onnx"
+    whisper_path = musetalk_dir / "models" / "whisper"
+
+    print("--- Initializing ONNX MuseTalk Inference ---")
+    # Pass the absolute path to the model directory
+    onnx_runner = ONNXMuseTalkInference(model_dir=str(model_dir), version="v15")
+
+    # --- STAGE 1: Face Detection and Cropping ---
+    print("\n--- STAGE 1: Face Detection and Cropping ---")
+    img_list = [avatar_path]
     
-    # Process the test avatar image
-    avatar_path = args.image
+    # We must be in the musetalk dir for get_landmark_and_bbox to find the dwpose model
+    os.chdir(musetalk_dir)
+    coords_list, frames_list = get_landmark_and_bbox(img_list)
+    os.chdir(project_root) # Change back to project root
     
-    if not os.path.exists(avatar_path):
-        print(f"Avatar image not found: {avatar_path}")
-        print("Please ensure you have the test data available")
-        return
+    bbox = coords_list[0]
+    frame = frames_list[0]
     
-    if args.audio and not os.path.exists(args.audio):
-        print(f"Audio file not found: {args.audio}")
-        print("Will use dummy audio data")
-        args.audio = None
+    # Save bounding box
+    bbox_data = {'x1': float(bbox[0]), 'y1': float(bbox[1]), 'x2': float(bbox[2]), 'y2': float(bbox[3])}
+    save_json(bbox_data, "1_face_bbox", output_dir)
     
-    # Create debugger and run comparison
-    debugger = UnityPythonDebugger()
-    debugger.run_complete_debug(avatar_path, args.audio, args.duration)
+    # Crop the face from the original frame
+    x1, y1, x2, y2 = bbox
+    cropped_face = frame[y1:y2, x1:x2]
+    save_image(cropped_face, "2_cropped_face_before_resize", output_dir)
+
+    # Resize to 256x256, which is what the VAE expects
+    resized_face = cv2.resize(cropped_face, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+    save_image(resized_face, "3_cropped_face_after_resize", output_dir)
+
+    # --- STAGE 2: VAE Encoding ---
+    print("\n--- STAGE 2: VAE Encoding ---")
+    
+    # Manually replicate preprocessing to save intermediates
+    img_rgb = cv2.cvtColor(resized_face, cv2.COLOR_BGR2RGB)
+    save_image(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), "4_vae_input_rgb", output_dir)
+    img_norm_0_1 = np.asarray([img_rgb], dtype=np.float32) / 255.0
+    img_chw = np.transpose(img_norm_0_1, (3, 0, 1, 2))
+    img_chw = np.squeeze(img_chw)
+    img_norm_minus1_1 = img_chw.copy()
+    for c in range(3):
+        img_norm_minus1_1[c] = (img_norm_minus1_1[c] - 0.5) / 0.5
+    vae_input_tensor = np.expand_dims(img_norm_minus1_1, 0)
+    save_tensor(vae_input_tensor, "5_vae_input_tensor", output_dir)
+
+    # Run actual encoding
+    ref_latents = onnx_runner.encode_image(resized_face)
+    save_tensor(ref_latents, "6_ref_latents", output_dir)
+    
+    masked_latents = onnx_runner.encode_image_with_half_mask(resized_face)
+    save_tensor(masked_latents, "7_masked_latents", output_dir)
+    
+    combined_latents = np.concatenate([masked_latents, ref_latents], axis=1)
+    save_tensor(combined_latents, "8_combined_latents_for_unet", output_dir)
+
+    # --- STAGE 3: Audio Processing ---
+    print("\n--- STAGE 3: Audio Processing ---")
+    # Pass absolute path to whisper model
+    audio_processor = AudioProcessor(feature_extractor_path=str(whisper_path))
+    whisper_features, librosa_len = audio_processor.get_audio_feature(audio_path)
+    audio_prompts = audio_processor.get_whisper_chunk(
+        whisper_input_features=whisper_features, device='cpu', weight_dtype=torch.float32,
+        whisper=None, librosa_length=librosa_len, fps=25
+    )
+    audio_prompt_frame_0 = audio_prompts[0:1, ...].numpy()
+    save_tensor(audio_prompt_frame_0, "9_audio_prompt_frame_0", output_dir)
+    
+    # --- STAGE 4: Positional Encoding ---
+    print("\n--- STAGE 4: Positional Encoding ---")
+    pe_output = onnx_runner.pe_session.run(['output'], {'audio_features': audio_prompt_frame_0})[0]
+    save_tensor(pe_output, "10_pe_output_frame_0", output_dir)
+    
+    # --- STAGE 5: UNet Denoising ---
+    print("\n--- STAGE 5: UNet Denoising ---")
+    timesteps = np.array([0], dtype=np.int64)
+    unet_output = onnx_runner.unet_session.run(
+        ['sample'],
+        {'sample': combined_latents, 'timestep': timesteps, 'encoder_hidden_states': pe_output}
+    )[0]
+    save_tensor(unet_output, "11_unet_output", output_dir)
+
+    # --- STAGE 6: VAE Decoding ---
+    print("\n--- STAGE 6: VAE Decoding ---")
+    decoded_image = onnx_runner.decode_latents(unet_output)
+    save_image(decoded_image, "12_decoded_image", output_dir)
+    
+    # --- STAGE 7: Blending ---
+    print("\n--- STAGE 7: Blending ---")
+    fp = FaceParsing(device='cpu')
+    resized_output = cv2.resize(decoded_image, (x2-x1, y2-y1), interpolation=cv2.INTER_LANCZOS4)
+    save_image(resized_output, "13_decoded_image_resized_for_blending", output_dir)
+    final_frame, face_mask = get_image(frame, resized_output, bbox, mode="jaw", fp=fp, return_mask=True)
+    save_image(final_frame, "14_final_blended_image", output_dir)
+    visible_mask = (face_mask * 255).astype(np.uint8)
+    save_image(visible_mask, "15_blending_mask", output_dir)
+    save_tensor(face_mask, "15_blending_mask_float", output_dir)
+
+    print(f"\n--- All debug data saved to '{str(output_dir.resolve())}' ---")
+
 
 if __name__ == "__main__":
-    main() 
+    main()

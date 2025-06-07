@@ -1,0 +1,18 @@
+{
+  "avatar_path": "data/video/00000000.png",
+  "audio_path": "data/audio/detective_1s.wav",
+  "face_bbox": {
+    "x1": 221,
+    "y1": 276,
+    "x2": 464,
+    "y2": 524,
+    "width": 243,
+    "height": 248
+  },
+  "audio_length": 12930,
+  "total_frames": 20,
+  "fps": 25,
+  "duration_seconds": 0.8,
+  "model_version": "v15",
+  "notes": "Complete ground truth outputs for ALL frames - 100% Unity-Python matching"
+}

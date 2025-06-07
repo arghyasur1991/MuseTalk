@@ -1,0 +1,16 @@
+{
+  "avatar_path": "data/video/00000000.png",
+  "audio_path": "data/audio/detective_1s.wav",
+  "face_bbox": {
+    "x1": 221,
+    "y1": 276,
+    "x2": 464,
+    "y2": 524,
+    "width": 243,
+    "height": 248
+  },
+  "audio_length": 12930,
+  "num_audio_chunks": 20,
+  "model_version": "v15",
+  "notes": "Ground truth outputs for Unity hardcoding"
+}
