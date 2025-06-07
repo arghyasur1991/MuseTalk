@@ -390,7 +390,10 @@ def export_whisper_to_onnx(whisper_model, output_path, device="cpu", opset_versi
             
         def forward(self, input_features):
             outputs = self.whisper.encoder(input_features, output_hidden_states=True)
-            return outputs.hidden_states[-1]  # Use last hidden state
+            # Stack ALL hidden states like Python implementation
+            # This is the key fix - Python uses torch.stack(outputs.hidden_states, dim=2)
+            hidden_states = torch.stack(outputs.hidden_states, dim=2)  # [batch, seq_len, layers, features]
+            return hidden_states
     
     whisper_wrapper = WhisperEncoderWrapper(whisper_model).to(device)
     
@@ -403,10 +406,10 @@ def export_whisper_to_onnx(whisper_model, output_path, device="cpu", opset_versi
         opset_version=opset_version,
         do_constant_folding=True,
         input_names=['input_features'],
-        output_names=['audio_features'],
+        output_names=['audio_features_all_layers'],  # More descriptive name
         dynamic_axes={
             'input_features': {0: 'batch_size', 2: 'seq_len'},
-            'audio_features': {0: 'batch_size', 1: 'seq_len'}
+            'audio_features_all_layers': {0: 'batch_size', 1: 'seq_len', 2: 'num_layers'}  # Updated for stacked layers
         },
         verbose=False,
         training=torch.onnx.TrainingMode.EVAL

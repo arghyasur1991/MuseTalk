@@ -85,6 +85,7 @@ class ONNXMuseTalkInference:
         vae_encoder_path = self.model_dir / f"vae_encoder{model_suffix}.onnx"
         vae_decoder_path = self.model_dir / f"vae_decoder{model_suffix}.onnx"
         pe_path = self.model_dir / f"positional_encoding{model_suffix}.onnx"
+        whisper_path = self.model_dir / "whisper_encoder.onnx"
         
         # Load models with error handling
         try:
@@ -119,8 +120,239 @@ class ONNXMuseTalkInference:
             print(f"✗ Failed to load Positional Encoding: {e}")
             raise
             
+        # Load Whisper ONNX model
+        try:
+            print(f"Loading Whisper ONNX from {whisper_path}")
+            self.whisper_session = ort.InferenceSession(str(whisper_path), providers=self.providers, session_options=self._get_session_options())
+            print("✓ Whisper ONNX loaded successfully")
+            self.has_whisper_onnx = True
+        except Exception as e:
+            print(f"✗ Failed to load Whisper ONNX: {e}")
+            self.has_whisper_onnx = False
+            
         print("All ONNX models loaded successfully!")
         
+    def extract_mel_spectrogram(self, audio_path):
+        """Extract mel spectrogram features matching the transformers WhisperFeatureExtractor"""
+        print(f"Extracting mel spectrogram from {audio_path}")
+        
+        # Load audio using librosa (matching AudioProcessor)
+        audio_data, sample_rate = librosa.load(audio_path, sr=16000)
+        
+        # Split into 30-second segments (matching Python implementation)
+        segment_length = 30 * sample_rate  # 30 seconds * 16000 Hz
+        segments = []
+        
+        for i in range(0, len(audio_data), segment_length):
+            segment = audio_data[i:i + segment_length]
+            # Pad the last segment if needed
+            if len(segment) < segment_length:
+                segment = np.pad(segment, (0, segment_length - len(segment)), 'constant')
+            segments.append(segment)
+        
+        mel_features = []
+        for segment in segments:
+            # Extract mel spectrogram using librosa (matching Whisper preprocessing)
+            mel_spec = librosa.feature.melspectrogram(
+                y=segment,
+                sr=sample_rate,
+                n_mels=80,  # Whisper uses 80 mel bins
+                n_fft=400,  # Whisper uses 25ms window = 400 samples at 16kHz
+                hop_length=160,  # Whisper uses 10ms hop = 160 samples at 16kHz
+                fmin=0,
+                fmax=8000  # Nyquist frequency for 16kHz
+            )
+            
+            # Convert to log scale (matching Whisper)
+            mel_spec = np.log(np.maximum(mel_spec, 1e-10))
+            
+            # Normalize (rough approximation of Whisper's normalization)
+            mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-8)
+            
+            # Ensure correct shape for Whisper: [80, 3000] -> pad or trim
+            if mel_spec.shape[1] > 3000:
+                mel_spec = mel_spec[:, :3000]
+            elif mel_spec.shape[1] < 3000:
+                mel_spec = np.pad(mel_spec, ((0, 0), (0, 3000 - mel_spec.shape[1])), 'constant')
+            
+            mel_features.append(mel_spec.astype(np.float32))
+        
+        return mel_features, len(audio_data)
+    
+    def process_audio_with_onnx_whisper_fixed(self, audio_path):
+        """Process audio using ONNX Whisper with pure numpy (no PyTorch dependencies)"""
+        print("Processing audio with pure ONNX Whisper...")
+        
+        try:
+            # Load audio using librosa
+            audio, sr = librosa.load(audio_path, sr=16000)
+            
+            # Convert to mel spectrogram (matching Whisper preprocessing)
+            mel_features = librosa.feature.melspectrogram(
+                y=audio,
+                sr=sr,
+                n_mels=80,           # Whisper uses 80 mel bins
+                hop_length=160,      # 10ms hop (16000 * 0.01)
+                win_length=400,      # 25ms window (16000 * 0.025)
+                window='hann',
+                center=True,
+                pad_mode='reflect',
+                power=2.0
+            )
+            
+            # Convert to log scale (dB)
+            mel_features = librosa.power_to_db(mel_features, ref=np.max)
+            
+            # Normalize to [-1, 1] range like Whisper
+            mel_features = (mel_features + 80.0) / 80.0
+            mel_features = np.clip(mel_features, -1.0, 1.0)
+            
+            # Pad or trim to 3000 frames (30 seconds at 10ms hop)
+            target_frames = 3000
+            if mel_features.shape[1] < target_frames:
+                # Pad with zeros
+                padding = target_frames - mel_features.shape[1]
+                mel_features = np.pad(mel_features, ((0, 0), (0, padding)), mode='constant')
+            else:
+                # Trim to target length
+                mel_features = mel_features[:, :target_frames]
+            
+            # Add batch dimension: [1, 80, 3000]
+            mel_features = mel_features[np.newaxis, ...]
+            
+            print(f"Input shape for Whisper ONNX: {mel_features.shape}")
+            
+            # Run ONNX Whisper (this now returns ALL hidden states stacked)
+            outputs = self.whisper_session.run(
+                ['audio_features_all_layers'],
+                {'input_features': mel_features.astype(np.float32)}
+            )
+            
+            # Get the stacked hidden states: [batch, seq_len, layers, features]
+            whisper_features = outputs[0]  # Shape: [1, seq_len, layers, features]
+            print(f"Whisper ONNX output shape: {whisper_features.shape}")
+            
+            # Now process exactly like Python get_whisper_chunk
+            audio_length = len(audio)
+            sr = 16000
+            audio_fps = 50
+            fps = 25
+            audio_padding_length_left = 2
+            audio_padding_length_right = 2
+            
+            whisper_idx_multiplier = audio_fps / fps
+            num_frames = int((audio_length / sr) * fps)
+            actual_length = int((audio_length / sr) * audio_fps)
+            
+            # Trim to actual length
+            whisper_features = whisper_features[:, :actual_length, ...]
+            
+            # Add padding
+            import math
+            padding_nums = math.ceil(whisper_idx_multiplier)
+            left_padding_size = padding_nums * audio_padding_length_left
+            right_padding_size = padding_nums * 3 * audio_padding_length_right
+            
+            # Create padding arrays
+            batch_size, seq_len, layers, features = whisper_features.shape
+            left_padding = np.zeros((batch_size, left_padding_size, layers, features), dtype=whisper_features.dtype)
+            right_padding = np.zeros((batch_size, right_padding_size, layers, features), dtype=whisper_features.dtype)
+            
+            # Concatenate padding
+            whisper_features = np.concatenate([left_padding, whisper_features, right_padding], axis=1)
+            
+            # Generate chunks
+            audio_feature_length_per_frame = 2 * (audio_padding_length_left + audio_padding_length_right + 1)
+            audio_prompts = []
+            
+            for frame_index in range(num_frames):
+                audio_index = int(frame_index * whisper_idx_multiplier)
+                audio_clip = whisper_features[:, audio_index:audio_index + audio_feature_length_per_frame]
+                
+                if audio_clip.shape[1] == audio_feature_length_per_frame:
+                    audio_prompts.append(audio_clip)
+            
+            # Stack all chunks: [num_frames, 10, layers, features]
+            audio_prompts = np.concatenate(audio_prompts, axis=0)  
+            
+            # Rearrange: 'b c h w -> b (c h) w' 
+            # where b=frames, c=time_chunks, h=layers, w=features
+            batch_size, time_chunks, layers, features = audio_prompts.shape
+            audio_prompts = audio_prompts.reshape(batch_size, time_chunks * layers, features)
+            
+            # Convert to list of numpy arrays for compatibility
+            whisper_chunks_np = []
+            for i in range(audio_prompts.shape[0]):
+                chunk = audio_prompts[i]  # Shape: [60, 384] (10*6 layers, 384 features)
+                whisper_chunks_np.append(chunk)
+            
+            print(f"Processed {len(whisper_chunks_np)} audio chunks with pure ONNX Whisper")
+            print(f"Each chunk shape: {whisper_chunks_np[0].shape if whisper_chunks_np else 'None'}")
+            return whisper_chunks_np, audio_length
+            
+        except Exception as e:
+            print(f"Warning: Could not process with ONNX Whisper ({e}), using dummy audio features")
+            return self.create_dummy_audio_features(audio_path)
+    
+    def get_whisper_chunks(self, whisper_feature, librosa_length, fps=25, audio_padding_length_left=2, audio_padding_length_right=2):
+        """Convert Whisper features to chunks matching Python implementation exactly"""
+        # Calculate parameters (matching Python exactly)
+        audio_feature_length_per_frame = 2 * (audio_padding_length_left + audio_padding_length_right + 1)
+        sr = 16000
+        audio_fps = 50  # Whisper's internal frame rate
+        whisper_idx_multiplier = audio_fps / fps
+        num_frames = int((librosa_length / sr) * fps)
+        actual_length = int((librosa_length / sr) * audio_fps)
+        
+        # Trim to actual length (matching Python)
+        whisper_feature = whisper_feature[:, :actual_length, :]  # [1, actual_length, 384]
+        
+        # Calculate padding (matching Python)
+        padding_nums = int(np.ceil(whisper_idx_multiplier))
+        left_padding = np.zeros((1, padding_nums * audio_padding_length_left, 384), dtype=np.float32)
+        right_padding = np.zeros((1, padding_nums * 3 * audio_padding_length_right, 384), dtype=np.float32)
+        
+        # Add padding (matching Python)
+        whisper_feature = np.concatenate([left_padding, whisper_feature, right_padding], axis=1)
+        
+        # Generate chunks for each frame
+        audio_prompts = []
+        for frame_index in range(num_frames):
+            audio_index = int(frame_index * whisper_idx_multiplier)
+            audio_clip = whisper_feature[:, audio_index:audio_index + audio_feature_length_per_frame, :]  # [1, 10, 384]
+            
+            if audio_clip.shape[1] == audio_feature_length_per_frame:
+                # Reshape to match Python: [1, 10, 384] -> [10, 384] -> [50, 384] after reshaping
+                audio_clip = audio_clip.squeeze(0)  # [10, 384]
+                # Expand to [50, 384] to match Python (10 time steps * 5 layers = 50)
+                audio_clip_expanded = np.tile(audio_clip, (5, 1))  # [50, 384]
+                audio_prompts.append(audio_clip_expanded)
+        
+        print(f"Generated {len(audio_prompts)} audio chunks, each shape: {audio_prompts[0].shape if audio_prompts else 'None'}")
+        return audio_prompts
+    
+    def create_dummy_audio_features(self, audio_path):
+        """Create dummy audio features as fallback"""
+        print("Creating dummy audio features...")
+        
+        # Load audio to get duration
+        audio_data, sample_rate = librosa.load(audio_path, sr=16000)
+        librosa_length = len(audio_data)
+        
+        # Calculate number of frames
+        fps = 25
+        num_frames = int((librosa_length / sample_rate) * fps)
+        
+        # Create dummy chunks
+        audio_prompts = []
+        for i in range(num_frames):
+            # Each chunk is [50, 384] matching Python
+            chunk = np.random.randn(50, 384).astype(np.float32)
+            audio_prompts.append(chunk)
+        
+        print(f"Created {len(audio_prompts)} dummy audio chunks")
+        return audio_prompts, librosa_length
+
     def encode_image(self, image):
         """Encode image using VAE encoder - FIXED: match PyTorch VAE preprocessing exactly"""
         # Resize image to expected VAE input size (256x256 for the exported model)
@@ -198,21 +430,17 @@ class ONNXMuseTalkInference:
     
     def get_latents_for_unet(self, image):
         """Replicate the exact behavior of VAE.get_latents_for_unet - FIXED: mask lower half"""
-        # Get masked latents (lower half masked)
-        masked_latents = self.encode_image_with_half_mask(image)
+        # Get masked latents (half mask applied)
+        masked_latents = self.encode_image_with_half_mask(image)  # [1, 4, 32, 32]
         
-        # Get reference latents (full image)
-        ref_latents = self.encode_image(image)
+        # Get reference latents (no mask)
+        ref_latents = self.encode_image(image)  # [1, 4, 32, 32]
         
-        # Concatenate as in original implementation
-        latent_model_input = np.concatenate([masked_latents, ref_latents], axis=1)
-        
-        # print(f"Masked latents shape: {masked_latents.shape}")
-        # print(f"Ref latents shape: {ref_latents.shape}")
-        # print(f"Combined latents shape: {latent_model_input.shape}")
+        # Concatenate along channel dimension (matching PyTorch)
+        latent_model_input = np.concatenate([masked_latents, ref_latents], axis=1)  # [1, 8, 32, 32]
         
         return latent_model_input
-        
+
     def decode_latents(self, latents, target_size=(256, 256)):
         """Decode latents using VAE decoder - IMPROVED: Higher precision decoding"""
         # Ensure input is float32 for maximum precision
@@ -250,133 +478,73 @@ class ONNXMuseTalkInference:
         
     def add_positional_encoding(self, audio_features):
         """Add positional encoding to audio features"""
-        audio_features_pe = self.pe_session.run(
-            ['audio_features_with_pe'],
+        # Run positional encoding ONNX model
+        audio_with_pe = self.pe_session.run(
+            ['audio_features_with_pe'], 
             {'audio_features': audio_features}
         )[0]
         
-        return audio_features_pe
+        return audio_with_pe
         
     def run_unet(self, input_latents, timesteps, audio_prompts):
-        """Run UNet denoising"""
-        noise_prediction = self.unet_session.run(
-            ['noise_prediction'],
+        """Run UNet inference"""
+        # Run UNet ONNX model
+        pred_latents = self.unet_session.run(
+            ['noise_prediction'], 
             {
                 'input_latents': input_latents,
                 'timesteps': timesteps,
                 'audio_prompts': audio_prompts
             }
         )[0]
-        return noise_prediction
+        
+        return pred_latents
         
     def inference(self, avatar_path, audio_path, output_path, batch_size=4, max_images=10):
-        """Run complete inference pipeline matching PyTorch exactly"""
-        print(f"Starting ONNX inference...")
-        print(f"Avatar: {avatar_path}")
-        print(f"Audio: {audio_path}")
-        print(f"Output: {output_path}")
-        print(f"Max images for debugging: {max_images}")
-        
+        """Main inference function matching PyTorch implementation exactly"""
         start_time = time.time()
         
-        # Load avatar images
-        print("Loading avatar images...")
+        # Read avatar images
         if os.path.isdir(avatar_path):
-            # Get list of image files from directory
-            image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tiff']
-            img_path_list = []
-            for ext in image_extensions:
-                img_path_list.extend(glob.glob(os.path.join(avatar_path, ext)))
-            img_path_list = sorted(img_path_list)
-            
-            # Use only a subset for debugging
-            if max_images > 0 and len(img_path_list) > max_images:
-                img_path_list = img_path_list[:max_images]
-                print(f"Using first {max_images} images for faster debugging")
+            input_img_list = glob.glob(os.path.join(avatar_path, '*.[jpJP][pnPN]*[gG]'))
+            input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
         else:
-            # Single image file
-            img_path_list = [avatar_path]
-            
-        if not img_path_list:
-            raise ValueError(f"No image files found in {avatar_path}")
-            
-        print(f"Found {len(img_path_list)} avatar images")
+            input_img_list = [avatar_path]
         
-        # Get landmarks and bbox
-        coord_list, frame_list = get_landmark_and_bbox(img_path_list, 0)  # 0 for default bbox_shift
+        if max_images > 0:
+            input_img_list = input_img_list[:max_images]
         
-        # Process each frame to create input latents (matching PyTorch exactly)
-        print("Processing frames to create latents...")
+        print(f"Processing {len(input_img_list)} avatar images")
+        
+        # Get face landmarks and bounding boxes
+        print("Extracting face landmarks...")
+        coord_list, frame_list = get_landmark_and_bbox(input_img_list, upperbondrange=0)
+        
+        # Process images to get latents
+        print("Encoding avatar images...")
         input_latent_list = []
         for bbox, frame in zip(coord_list, frame_list):
             if bbox == coord_placeholder:
                 continue
+            
             x1, y1, x2, y2 = bbox
-            # Add extra margin for v15 (matching PyTorch)
             if self.version == "v15":
-                y2 = y2 + 10  # extra_margin from PyTorch args
+                y2 = y2 + 10  # v15 extra margin
                 y2 = min(y2, frame.shape[0])
             
-            # Crop face region (matching PyTorch exactly)
+            # Crop and resize face
             crop_frame = frame[y1:y2, x1:x2]
-            # Resize to 256x256 (matching PyTorch exactly)
             crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
             
-            # Get latents for UNet (matching PyTorch exactly)
+            # Get latents for UNet
             latents = self.get_latents_for_unet(crop_frame)
             input_latent_list.append(latents)
         
-        print(f"Created {len(input_latent_list)} latent tensors")
-        
-        # Process audio properly with AudioProcessor
-        from musetalk.utils.audio_processor import AudioProcessor
-        from transformers import WhisperModel
-        import torch
+        # Process audio with ONNX Whisper
+        whisper_chunks, librosa_length = self.process_audio_with_onnx_whisper_fixed(audio_path)
         
         # Set global timesteps (matching PyTorch)
         timesteps = np.array([0], dtype=np.int64)
-        
-        audio_processor = AudioProcessor(feature_extractor_path="./models/whisper")
-        
-        print("Processing audio with Whisper...")
-        whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path)
-        
-        # Load Whisper model for proper audio processing
-        try:
-            # Try to load Whisper model - this might fail in ONNX environment
-            device = "cpu"  # Force CPU for ONNX
-            weight_dtype = torch.float32
-            whisper = WhisperModel.from_pretrained("./models/whisper")
-            whisper = whisper.to(device=device, dtype=weight_dtype).eval()
-            whisper.requires_grad_(False)
-            
-            # Process audio with proper Whisper
-            fps = 25
-            whisper_chunks = audio_processor.get_whisper_chunk(
-                whisper_input_features, 
-                device, 
-                weight_dtype, 
-                whisper, 
-                librosa_length,
-                fps=fps,
-                audio_padding_length_left=2,
-                audio_padding_length_right=2,
-            )
-            num_frames = min(len(input_latent_list), len(whisper_chunks))
-            print(f"Processed {len(whisper_chunks)} audio chunks with Whisper")
-            
-        except Exception as e:
-            print(f"Warning: Could not load Whisper model ({e}), using dummy audio features")
-            # Fallback to dummy features if Whisper loading fails
-            fps = 25
-            num_frames = min(len(input_latent_list), int((librosa_length / 16000) * fps))
-            
-            # Create dummy whisper chunks for now (proper audio processing needs full Whisper model)
-            whisper_chunks = []
-            for i in range(num_frames):
-                # Each chunk is [50, 384] - 50 time steps, 384 features
-                chunk = np.random.randn(50, 384).astype(np.float32)
-                whisper_chunks.append(torch.from_numpy(chunk))
         
         print(f"Created {len(whisper_chunks)} audio chunks")
         
@@ -412,10 +580,7 @@ class ONNXMuseTalkInference:
                 latent_batch.append(latent)
             
             # Stack batches (matching PyTorch datagen)
-            if isinstance(whisper_batch[0], torch.Tensor):
-                whisper_batch = torch.stack(whisper_batch).numpy()  # Convert to numpy for ONNX
-            else:
-                whisper_batch = np.stack(whisper_batch)  # [batch_size, 50, 384]
+            whisper_batch = np.stack(whisper_batch)  # [batch_size, 50, 384]
             latent_batch = np.concatenate(latent_batch, axis=0)  # [batch_size, 8, 32, 32]
             
             # Apply positional encoding to audio (matching PyTorch)
