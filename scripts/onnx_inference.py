@@ -519,8 +519,8 @@ class ONNXMuseTalkInference:
         # Get face landmarks and bounding boxes
         backend_name = "InsightFace" if use_insightface else "MMPose"
         print(f"Extracting face landmarks with {backend_name}...")
-        coord_list, frame_list = get_landmark_and_bbox(input_img_list, upperbondrange=0, use_insightface=use_insightface)
-        
+        debug_dir = os.path.join(output_path, "debug")
+        coord_list, frame_list = get_landmark_and_bbox(input_img_list, upperbondrange=0, use_insightface=use_insightface, debug_dir=debug_dir)
         # Process images to get latents
         print("Encoding avatar images...")
         input_latent_list = []

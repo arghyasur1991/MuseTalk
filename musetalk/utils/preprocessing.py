@@ -484,7 +484,7 @@ def get_bbox_range_mmpose(img_list, upperbondrange=0):
     return text_range
     
 
-def get_landmark_and_bbox_insightface(img_list, upperbondrange=0):
+def get_landmark_and_bbox_insightface(img_list, upperbondrange=0, debug_dir=None):
     """InsightFace-based face detection and landmarking using SCRFD + 1k3d68"""
     frames = read_imgs(img_list)
     coords_list = []
@@ -497,7 +497,7 @@ def get_landmark_and_bbox_insightface(img_list, upperbondrange=0):
     average_range_minus = []
     average_range_plus = []
     
-    for frame in tqdm(frames):
+    for idx, frame in enumerate(tqdm(frames)):
         # Detect faces using SCRFD
         det_results, kps = scrfd_detector.detect(frame, max_num=1)  # Get the best face
         
@@ -508,6 +508,7 @@ def get_landmark_and_bbox_insightface(img_list, upperbondrange=0):
         # Get the best detection
         bbox = det_results[0]  # [x1, y1, x2, y2, score]
         x1, y1, x2, y2 = bbox[:4].astype(int)
+        original_bbox = (x1, y1, x2, y2)
         
         # Get detailed landmarks using 1k3d68 model
         landmarks = landmark_model.get_landmarks(frame, bbox)
@@ -520,31 +521,102 @@ def get_landmark_and_bbox_insightface(img_list, upperbondrange=0):
                 # Map 68-point landmarks to key facial points
                 face_land_mark = landmarks[:68].astype(np.int32)
                 
-                # Use nose area landmarks for adjustment (similar to MMPose mapping)
-                half_face_coord = face_land_mark[30]  # Nose tip
-                range_minus = (face_land_mark[31] - face_land_mark[30])[1] if len(face_land_mark) > 31 else 5
-                range_plus = (face_land_mark[30] - face_land_mark[29])[1] if len(face_land_mark) > 29 else 5
+                # Fix landmark mapping: 68-point landmarks have different indices
+                # Standard 68-point landmark mapping:
+                # 27-35: Nose bridge and tip (30 is nose tip)
+                # But we need to map to MMPose-like coordinates for compatibility
+                
+                # Use standard nose tip (landmark 30) but create similar range calculation
+                nose_tip = face_land_mark[30]  # Standard nose tip
+                
+                # Use nose bridge points for range calculation (more reliable)
+                nose_bridge_top = face_land_mark[27]  # Top of nose bridge
+                nose_bridge_bottom = face_land_mark[30]  # Nose tip
+                
+                # Calculate ranges similar to MMPose but using proper 68-point landmarks
+                range_minus = abs((nose_bridge_bottom - nose_bridge_top)[1]) if len(face_land_mark) > 30 else 20
+                range_plus = abs((nose_bridge_bottom - nose_bridge_top)[1]) if len(face_land_mark) > 30 else 20
+                
+                # Use nose tip as reference point
+                half_face_coord = nose_tip.copy()
                 
                 average_range_minus.append(abs(range_minus))
                 average_range_plus.append(abs(range_plus))
                 
-                # Apply upper bound range adjustment
+                # For now, use the original SCRFD detection bbox with minimal landmark adjustment
+                # This ensures we get proper mouth coverage similar to MMPose
+                
+                # Get the chin point for reference
+                chin_point = face_land_mark[8]  # Bottom of chin (landmark 8)
+                
+                # Use MMPose-like calculation but with InsightFace landmarks
+                # Calculate adjustment based on nose tip position
                 if upperbondrange != 0:
                     half_face_coord[1] = upperbondrange + half_face_coord[1]
                 
-                # Calculate face height and adjust bbox
-                half_face_dist = np.max(face_land_mark[:, 1]) - half_face_coord[1]
+                # Use the original SCRFD bbox but adjust top based on landmarks
+                fx1, fy1, fx2, fy2 = original_bbox
+                
+                # Calculate half face distance using landmark-based method  
+                half_face_dist = chin_point[1] - half_face_coord[1]
                 upper_bond = half_face_coord[1] - half_face_dist
                 
-                # Create landmark-based bbox
+                # Create bbox that combines SCRFD detection with landmark adjustment
                 f_landmark = (
-                    np.min(face_land_mark[:, 0]),
-                    int(upper_bond),
-                    np.max(face_land_mark[:, 0]),
-                    np.max(face_land_mark[:, 1])
+                    fx1,  # Keep original left
+                    max(0, int(upper_bond)),  # Landmark-adjusted top
+                    fx2,  # Keep original right  
+                    fy2   # Keep original bottom
                 )
                 
                 lx1, ly1, lx2, ly2 = f_landmark
+                
+                # Debug: Save comparison images
+                if debug_dir and idx == 0:  # Only debug first frame
+                    debug_frame = frame.copy()
+                    # Draw original detection bbox in red
+                    cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(debug_frame, 'SCRFD Det', (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    
+                    # Draw landmark-based bbox in green
+                    cv2.rectangle(debug_frame, (lx1, ly1), (lx2, ly2), (0, 255, 0), 2)
+                    cv2.putText(debug_frame, 'Landmark Bbox', (lx1, ly1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # Draw key landmarks
+                    key_points = [28, 29, 30, 31]  # Nose area
+                    for pt_idx in key_points:
+                        if pt_idx < len(face_land_mark):
+                            pt = face_land_mark[pt_idx]
+                            cv2.circle(debug_frame, (int(pt[0]), int(pt[1])), 3, (255, 0, 0), -1)
+                            cv2.putText(debug_frame, str(pt_idx), (int(pt[0])+5, int(pt[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                    
+                    # Draw mouth landmarks for lip movement check
+                    mouth_points = list(range(48, 68))  # Mouth region
+                    for pt_idx in mouth_points:
+                        pt = face_land_mark[pt_idx]
+                        cv2.circle(debug_frame, (int(pt[0]), int(pt[1])), 2, (0, 255, 255), -1)
+                    
+                    # Save debug image
+                    os.makedirs(debug_dir, exist_ok=True)
+                    cv2.imwrite(os.path.join(debug_dir, f"insightface_debug_{idx}.jpg"), debug_frame)
+                    
+                    # Save cropped regions
+                    if ly2 - ly1 > 0 and lx2 - lx1 > 0 and lx1 >= 0 and ly1 >= 0:
+                        crop_landmark = frame[ly1:ly2, lx1:lx2]
+                        cv2.imwrite(os.path.join(debug_dir, f"insightface_crop_landmark_{idx}.jpg"), crop_landmark)
+                    
+                    crop_original = frame[y1:y2, x1:x2] 
+                    cv2.imwrite(os.path.join(debug_dir, f"insightface_crop_original_{idx}.jpg"), crop_original)
+                    
+                    print(f"DEBUG InsightFace - Frame {idx}:")
+                    print(f"  Original SCRFD bbox: {original_bbox}")
+                    print(f"  Landmark bbox: {f_landmark}")
+                    print(f"  Half face coord (nose tip): {half_face_coord}")
+                    print(f"  Chin point (landmark 8): {chin_point}")
+                    print(f"  Upper bond calculation: {upper_bond}")
+                    print(f"  Half face distance: {half_face_dist}")
+                    print(f"  Mouth landmarks range: {face_land_mark[48:68, :2].min(axis=0)} to {face_land_mark[48:68, :2].max(axis=0)}")
+                    print(f"  Mouth center: {face_land_mark[48:68, :2].mean(axis=0)}")
                 
                 # Validate landmark bbox
                 if ly2 - ly1 <= 0 or lx2 - lx1 <= 0 or lx1 < 0:
@@ -572,7 +644,7 @@ def get_landmark_and_bbox_insightface(img_list, upperbondrange=0):
     return coords_list, frames
 
 
-def get_landmark_and_bbox(img_list, upperbondrange=0, use_insightface=True):
+def get_landmark_and_bbox(img_list, upperbondrange=0, use_insightface=True, debug_dir=None):
     """
     Main function for face detection and landmarking.
     
@@ -581,14 +653,15 @@ def get_landmark_and_bbox(img_list, upperbondrange=0, use_insightface=True):
         upperbondrange: Bbox adjustment parameter  
         use_insightface: If True, use InsightFace models (SCRFD + 1k3d68), 
                         else use MMPose + face_detection
+        debug_dir: Directory to save debug images (optional)
     """
     if use_insightface:
-        return get_landmark_and_bbox_insightface(img_list, upperbondrange)
+        return get_landmark_and_bbox_insightface(img_list, upperbondrange, debug_dir)
     else:
-        return get_landmark_and_bbox_mmpose(img_list, upperbondrange)
+        return get_landmark_and_bbox_mmpose(img_list, upperbondrange, debug_dir)
 
 
-def get_landmark_and_bbox_mmpose(img_list, upperbondrange=0):
+def get_landmark_and_bbox_mmpose(img_list, upperbondrange=0, debug_dir=None):
     """Original MMPose-based implementation (kept for reference)"""
     frames = read_imgs(img_list)
     batch_size_fa = 1
@@ -601,6 +674,7 @@ def get_landmark_and_bbox_mmpose(img_list, upperbondrange=0):
         print('get key_landmark and face bounding boxes with MMPose, default value')
     average_range_minus = []
     average_range_plus = []
+    frame_idx = 0
     for fb in tqdm(batches):
         results = inference_topdown(model, np.asarray(fb)[0])
         results = merge_data_samples(results)
@@ -618,6 +692,7 @@ def get_landmark_and_bbox_mmpose(img_list, upperbondrange=0):
                 coords_list += [coord_placeholder]
                 continue
             
+            original_bbox = f
             half_face_coord =  face_land_mark[29]#np.mean([face_land_mark[28], face_land_mark[29]], axis=0)
             range_minus = (face_land_mark[30]- face_land_mark[29])[1]
             range_plus = (face_land_mark[29]- face_land_mark[28])[1]
@@ -631,12 +706,59 @@ def get_landmark_and_bbox_mmpose(img_list, upperbondrange=0):
             f_landmark = (np.min(face_land_mark[:, 0]),int(upper_bond),np.max(face_land_mark[:, 0]),np.max(face_land_mark[:,1]))
             x1, y1, x2, y2 = f_landmark
             
+            # Debug: Save comparison images  
+            if debug_dir and frame_idx == 0:  # Only debug first frame
+                frame = fb[0]
+                debug_frame = frame.copy()
+                
+                # Draw original detection bbox in red
+                fx1, fy1, fx2, fy2 = f
+                cv2.rectangle(debug_frame, (fx1, fy1), (fx2, fy2), (0, 0, 255), 2)
+                cv2.putText(debug_frame, 'Face Det', (fx1, fy1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Draw landmark-based bbox in green
+                cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(debug_frame, 'MMPose Landmark Bbox', (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Draw key landmarks
+                key_points = [28, 29, 30]  # Nose area used by MMPose
+                for pt_idx in key_points:
+                    if pt_idx < len(face_land_mark):
+                        pt = face_land_mark[pt_idx]
+                        cv2.circle(debug_frame, (int(pt[0]), int(pt[1])), 3, (255, 0, 0), -1)
+                        cv2.putText(debug_frame, str(pt_idx), (int(pt[0])+5, int(pt[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # Draw ALL MMPose face landmarks
+                for pt_idx, pt in enumerate(face_land_mark):
+                    cv2.circle(debug_frame, (int(pt[0]), int(pt[1])), 1, (0, 255, 255), -1)
+                
+                # Save debug image
+                os.makedirs(debug_dir, exist_ok=True)
+                cv2.imwrite(os.path.join(debug_dir, f"mmpose_debug_{frame_idx}.jpg"), debug_frame)
+                
+                # Save cropped regions
+                if y2 - y1 > 0 and x2 - x1 > 0 and x1 >= 0 and y1 >= 0:
+                    crop_landmark = frame[y1:y2, x1:x2]
+                    cv2.imwrite(os.path.join(debug_dir, f"mmpose_crop_landmark_{frame_idx}.jpg"), crop_landmark)
+                
+                crop_original = frame[fy1:fy2, fx1:fx2]
+                cv2.imwrite(os.path.join(debug_dir, f"mmpose_crop_original_{frame_idx}.jpg"), crop_original)
+                
+                print(f"DEBUG MMPose - Frame {frame_idx}:")
+                print(f"  Original Face Detection bbox: {original_bbox}")
+                print(f"  Landmark bbox: {f_landmark}")
+                print(f"  Half face coord (landmark 29): {half_face_coord}")
+                print(f"  Key landmarks 28,29,30: {face_land_mark[28]}, {face_land_mark[29]}, {face_land_mark[30]}")
+                print(f"  Face landmarks shape: {face_land_mark.shape}")
+            
             if y2-y1<=0 or x2-x1<=0 or x1<0: # if the landmark bbox is not suitable, reuse the bbox
                 coords_list += [f]
                 w,h = f[2]-f[0], f[3]-f[1]
                 print("error bbox:",f)
             else:
                 coords_list += [f_landmark]
+            
+            frame_idx += 1
     
     print("********************************************bbox_shift parameter adjustment (MMPose)**********************************************************")
     print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
