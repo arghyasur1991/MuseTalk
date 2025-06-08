@@ -553,14 +553,14 @@ def get_bbox_range_mmpose(img_list, upperbondrange=0):
     
 
 def get_landmark_and_bbox_insightface(img_list, upperbondrange=0, debug_dir=None):
-    """HYBRID: InsightFace SCRFD detection + MMPose landmarks for best of both worlds"""
+    """HYBRID: SCRFD detection + face-aligned 1k3d68 landmarks (ONNX-only, Unity-ready)"""
     frames = read_imgs(img_list)
     coords_list = []
     
     if upperbondrange != 0:
-        print('get key_landmark and face bounding boxes with HYBRID (SCRFD+MMPose), bbox_shift:', upperbondrange)
+        print('get key_landmark and face bounding boxes with HYBRID (SCRFD+1k3d68), bbox_shift:', upperbondrange)
     else:
-        print('get key_landmark and face bounding boxes with HYBRID (SCRFD+MMPose), default value')
+        print('get key_landmark and face bounding boxes with HYBRID (SCRFD+1k3d68), default value')
     
     average_range_minus = []
     average_range_plus = []
@@ -578,60 +578,150 @@ def get_landmark_and_bbox_insightface(img_list, upperbondrange=0, debug_dir=None
         x1, y1, x2, y2 = bbox[:4].astype(int)
         original_bbox = (x1, y1, x2, y2)
         
-        # SIMPLIFIED APPROACH: Just use SCRFD detection bbox with minimal expansion
-        # Don't try to create fake landmarks - let face parsing handle the mask
-        fx1, fy1, fx2, fy2 = original_bbox
+        # IMPROVED APPROACH: Use SCRFD detection + proper 1k3d68 landmarks
+        # The key insight: 1k3d68 needs face-aligned cropping, not just bbox cropping
         
-        # Minimal expansion to match typical face crop requirements
-        # Use conservative expansion based on SCRFD detection
-        center_x = (fx1 + fx2) / 2
-        center_y = (fy1 + fy2) / 2
-        
-        scrfd_w = fx2 - fx1
-        scrfd_h = fy2 - fy1
-        
-        # Use smaller expansion factor since SCRFD is already quite accurate
-        expansion_factor = 1.05  # Just 5% expansion
-        
-        new_w = scrfd_w * expansion_factor
-        new_h = scrfd_h * expansion_factor
-        
-        expanded_fx1 = max(0, int(center_x - new_w / 2))
-        expanded_fy1 = max(0, int(center_y - new_h / 2))
-        expanded_fx2 = min(frame.shape[1], int(center_x + new_w / 2))
-        expanded_fy2 = min(frame.shape[0], int(center_y + new_h / 2))
-        
-        f_landmark = (expanded_fx1, expanded_fy1, expanded_fx2, expanded_fy2)
-        lx1, ly1, lx2, ly2 = f_landmark
-        
-        # For compatibility with range calculation, use SCRFD keypoints directly
+        # Step 1: Get proper 1k3d68 landmarks using SCRFD keypoints for better face alignment
+        landmarks_68 = None
         if kps is not None and len(kps) > 0:
             scrfd_kps = kps[0]
             if scrfd_kps.shape[0] >= 5:
-                nose_tip = scrfd_kps[2].astype(int)  # Use SCRFD nose directly
-                mouth_center = ((scrfd_kps[3] + scrfd_kps[4]) / 2).astype(int)  # Average of mouth corners
+                # Use SCRFD keypoints to create a better face-aligned crop for 1k3d68
+                # This is the key fix: align the face properly before landmark extraction
+                left_eye = scrfd_kps[0]
+                right_eye = scrfd_kps[1]
+                nose_tip = scrfd_kps[2]
+                left_mouth = scrfd_kps[3]
+                right_mouth = scrfd_kps[4]
                 
-                # Simple range calculation based on nose to mouth distance
-                nose_to_mouth_dist = abs(mouth_center[1] - nose_tip[1])
-                range_minus = range_plus = max(10, nose_to_mouth_dist // 3)
+                # Calculate face center and scale using eye distance (like face recognition)
+                eye_center = (left_eye + right_eye) / 2
+                eye_distance = np.linalg.norm(right_eye - left_eye)
                 
-                # Use nose tip for bbox adjustment reference
-                half_face_coord = nose_tip.copy()
+                # Create a more accurate bbox for 1k3d68 based on facial geometry
+                face_scale = eye_distance * 2.2  # Empirical factor for good face crop
                 
-                print(f"Using SCRFD nose tip: {nose_tip}, mouth center: {mouth_center}")
-                print(f"Calculated range: {range_minus}")
+                # Center the crop around eye center but shift down slightly for better coverage
+                crop_center_x = eye_center[0]
+                crop_center_y = eye_center[1] + eye_distance * 0.3  # Shift down for mouth coverage
+                
+                # Create square crop for 1k3d68 (it expects square input)
+                half_size = face_scale / 2
+                crop_x1 = max(0, int(crop_center_x - half_size))
+                crop_y1 = max(0, int(crop_center_y - half_size))
+                crop_x2 = min(frame.shape[1], int(crop_center_x + half_size))
+                crop_y2 = min(frame.shape[0], int(crop_center_y + half_size))
+                
+                # Make it square by taking the minimum dimension
+                crop_w = crop_x2 - crop_x1
+                crop_h = crop_y2 - crop_y1
+                crop_size = min(crop_w, crop_h)
+                
+                # Recalculate with square dimensions
+                crop_x1 = max(0, int(crop_center_x - crop_size/2))
+                crop_y1 = max(0, int(crop_center_y - crop_size/2))
+                crop_x2 = min(frame.shape[1], crop_x1 + crop_size)
+                crop_y2 = min(frame.shape[0], crop_y1 + crop_size)
+                
+                aligned_bbox = (crop_x1, crop_y1, crop_x2, crop_y2)
+                
+                print(f"SCRFD keypoints: eyes dist={eye_distance:.1f}, face_scale={face_scale:.1f}")
+                print(f"Aligned bbox: {aligned_bbox} = {crop_x2-crop_x1}x{crop_y2-crop_y1}")
+                
+                # Extract landmarks using the aligned bbox
+                landmarks_68 = landmark_model.get_landmarks(frame, aligned_bbox)
+        
+        # Step 2: Process landmarks and create final bbox
+        if landmarks_68 is not None and landmarks_68.shape[0] >= 68:
+            # Use the properly extracted 68-point landmarks
+            face_land_mark = landmarks_68[:68].astype(np.int32)
+            
+            # Use standard MMPose-compatible landmark indices
+            nose_tip = face_land_mark[30]  # Standard nose tip
+            nose_bridge_top = face_land_mark[27]  # Top of nose bridge
+            
+            # Calculate ranges like MMPose
+            range_minus = abs((face_land_mark[30] - face_land_mark[29])[1]) if len(face_land_mark) > 30 else 20
+            range_plus = abs((face_land_mark[29] - face_land_mark[28])[1]) if len(face_land_mark) > 29 else 20
+            
+            half_face_coord = face_land_mark[29].copy()  # Use landmark 29 like MMPose
+            
+            print(f"1k3d68 landmarks: nose_tip={nose_tip}, landmark_29={half_face_coord}")
+            print(f"Calculated ranges: minus={range_minus}, plus={range_plus}")
+            
+            # Apply bbox shift if specified
+            if upperbondrange != 0:
+                half_face_coord[1] = upperbondrange + half_face_coord[1]
+            
+            # Create face bbox using landmark center but SCRFD-like size for proper blending
+            # Use landmark center for accurate positioning, but maintain reasonable face coverage
+            
+            # Get landmark center and bounds
+            landmark_center_x = np.mean(face_land_mark[:, 0])
+            landmark_center_y = np.mean(face_land_mark[:, 1])
+            
+            # Use SCRFD detection size as reference for proper face coverage
+            fx1, fy1, fx2, fy2 = original_bbox
+            scrfd_w = fx2 - fx1
+            scrfd_h = fy2 - fy1
+            
+            # Create bbox centered on landmarks but with SCRFD-like dimensions
+            # This ensures we have enough face area for blending while being landmark-accurate
+            face_w = int(scrfd_w * 0.9)  # Slightly smaller than SCRFD for precision
+            face_h = int(scrfd_h * 0.9)
+            
+            lx1 = max(0, int(landmark_center_x - face_w / 2))
+            ly1 = max(0, int(landmark_center_y - face_h / 2))
+            lx2 = min(frame.shape[1], lx1 + face_w)
+            ly2 = min(frame.shape[0], ly1 + face_h)
+            
+            landmark_bbox = (lx1, ly1, lx2, ly2)
+            
+            # Validate landmark bbox
+            if ly2 - ly1 <= 0 or lx2 - lx1 <= 0 or lx1 < 0:
+                print(f"Invalid landmark bbox: {landmark_bbox}, using SCRFD bbox")
+                # Fallback to SCRFD with minimal expansion
+                fx1, fy1, fx2, fy2 = original_bbox
+                expansion_factor = 1.05
+                center_x, center_y = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+                scrfd_w, scrfd_h = fx2 - fx1, fy2 - fy1
+                new_w, new_h = scrfd_w * expansion_factor, scrfd_h * expansion_factor
+                lx1 = max(0, int(center_x - new_w / 2))
+                ly1 = max(0, int(center_y - new_h / 2))
+                lx2 = min(frame.shape[1], int(center_x + new_w / 2))
+                ly2 = min(frame.shape[0], int(center_y + new_h / 2))
+            
+            f_landmark = (lx1, ly1, lx2, ly2)
+            
+        else:
+            print("Failed to extract 1k3d68 landmarks, using SCRFD bbox")
+            # Fallback to SCRFD approach
+            fx1, fy1, fx2, fy2 = original_bbox
+            expansion_factor = 1.05
+            center_x, center_y = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+            scrfd_w, scrfd_h = fx2 - fx1, fy2 - fy1
+            new_w, new_h = scrfd_w * expansion_factor, scrfd_h * expansion_factor
+            lx1 = max(0, int(center_x - new_w / 2))
+            ly1 = max(0, int(center_y - new_h / 2))
+            lx2 = min(frame.shape[1], int(center_x + new_w / 2))
+            ly2 = min(frame.shape[0], int(center_y + new_h / 2))
+            f_landmark = (lx1, ly1, lx2, ly2)
+            
+            # Use SCRFD keypoints for range calculation
+            if kps is not None and len(kps) > 0:
+                scrfd_kps = kps[0]
+                if scrfd_kps.shape[0] >= 5:
+                    nose_tip = scrfd_kps[2].astype(int)
+                    mouth_center = ((scrfd_kps[3] + scrfd_kps[4]) / 2).astype(int)
+                    nose_to_mouth_dist = abs(mouth_center[1] - nose_tip[1])
+                    range_minus = range_plus = max(10, nose_to_mouth_dist // 3)
+                    half_face_coord = nose_tip.copy()
+                else:
+                    range_minus = range_plus = 20
+                    half_face_coord = np.array([int(center_x), int(center_y)])
             else:
-                # Fallback values
                 range_minus = range_plus = 20
                 half_face_coord = np.array([int(center_x), int(center_y)])
-        else:
-            # Fallback values  
-            range_minus = range_plus = 20
-            half_face_coord = np.array([int(center_x), int(center_y)])
-        
-        # Apply bbox shift if specified
-        if upperbondrange != 0:
-            half_face_coord[1] = upperbondrange + half_face_coord[1]
         
         average_range_minus.append(abs(range_minus))
         average_range_plus.append(abs(range_plus))
@@ -643,9 +733,15 @@ def get_landmark_and_bbox_insightface(img_list, upperbondrange=0, debug_dir=None
             cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             cv2.putText(debug_frame, 'SCRFD Det', (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
-            # Draw expanded bbox in green  
+            # Draw aligned crop bbox in blue (if available)
+            if 'aligned_bbox' in locals():
+                ax1, ay1, ax2, ay2 = aligned_bbox
+                cv2.rectangle(debug_frame, (ax1, ay1), (ax2, ay2), (255, 0, 0), 2)
+                cv2.putText(debug_frame, 'Aligned Crop', (ax1, ay1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            
+            # Draw final landmark bbox in green  
             cv2.rectangle(debug_frame, (lx1, ly1), (lx2, ly2), (0, 255, 0), 2)
-            cv2.putText(debug_frame, 'SCRFD Expanded', (lx1, ly1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(debug_frame, 'Final Bbox', (lx1, ly1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # Draw the 5 SCRFD keypoints
             if kps is not None and len(kps) > 0:
@@ -655,22 +751,42 @@ def get_landmark_and_bbox_insightface(img_list, upperbondrange=0, debug_dir=None
                     cv2.circle(debug_frame, (int(kp[0]), int(kp[1])), 4, (0, 255, 255), -1)  # Yellow circles
                     cv2.putText(debug_frame, name, (int(kp[0])+5, int(kp[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
             
+            # Draw 1k3d68 landmarks if available
+            if 'face_land_mark' in locals() and landmarks_68 is not None:
+                # Draw key 68-point landmarks
+                key_landmarks = [8, 27, 28, 29, 30, 33, 36, 39, 42, 45, 48, 54, 57, 64]  # Key facial points
+                for pt_idx in key_landmarks:
+                    if pt_idx < len(face_land_mark):
+                        pt = face_land_mark[pt_idx]
+                        cv2.circle(debug_frame, (int(pt[0]), int(pt[1])), 2, (255, 0, 255), -1)  # Magenta
+                        cv2.putText(debug_frame, str(pt_idx), (int(pt[0])+3, int(pt[1])-3), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+            
             # Save debug image
             os.makedirs(debug_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(debug_dir, f"scrfd_simple_debug_{idx}.jpg"), debug_frame)
+            cv2.imwrite(os.path.join(debug_dir, f"hybrid_debug_{idx}.jpg"), debug_frame)
             
             # Save cropped regions
             if ly2 - ly1 > 0 and lx2 - lx1 > 0 and lx1 >= 0 and ly1 >= 0:
-                crop_expanded = frame[ly1:ly2, lx1:lx2]
-                cv2.imwrite(os.path.join(debug_dir, f"scrfd_simple_crop_expanded_{idx}.jpg"), crop_expanded)
+                crop_final = frame[ly1:ly2, lx1:lx2]
+                cv2.imwrite(os.path.join(debug_dir, f"hybrid_crop_final_{idx}.jpg"), crop_final)
             
             crop_original = frame[y1:y2, x1:x2] 
-            cv2.imwrite(os.path.join(debug_dir, f"scrfd_simple_crop_original_{idx}.jpg"), crop_original)
+            cv2.imwrite(os.path.join(debug_dir, f"hybrid_crop_original_{idx}.jpg"), crop_original)
             
-            print(f"DEBUG SCRFD Simple - Frame {idx}:")
-            print(f"  Original SCRFD bbox: {original_bbox} = {scrfd_w}x{scrfd_h}")
-            print(f"  Expanded bbox: {f_landmark} = {lx2-lx1}x{ly2-ly1}")
-            print(f"  Expansion factor: {expansion_factor}")
+            # Save aligned crop if available
+            if 'aligned_bbox' in locals():
+                ax1, ay1, ax2, ay2 = aligned_bbox
+                if ay2 - ay1 > 0 and ax2 - ax1 > 0:
+                    crop_aligned = frame[ay1:ay2, ax1:ax2]
+                    cv2.imwrite(os.path.join(debug_dir, f"hybrid_crop_aligned_{idx}.jpg"), crop_aligned)
+            
+            print(f"DEBUG Hybrid SCRFD+1k3d68 - Frame {idx}:")
+            print(f"  Original SCRFD bbox: {original_bbox}")
+            if 'aligned_bbox' in locals():
+                print(f"  Aligned crop bbox: {aligned_bbox}")
+            print(f"  Final landmark bbox: {f_landmark}")
+            if 'landmarks_68' in locals() and landmarks_68 is not None:
+                print(f"  Successfully extracted {len(landmarks_68)} landmarks")
             print(f"  Half face coord: {half_face_coord}")
         
         # Validate landmark bbox
