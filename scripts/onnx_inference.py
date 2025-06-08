@@ -614,10 +614,32 @@ class ONNXMuseTalkInference:
                 
                 # Blend with original image (matching PyTorch)
                 ori_frame = frame_list[frame_idx % len(frame_list)].copy()
+                
+                # Debug: Save intermediate results for first few frames
+                if frame_idx < 3:  # Debug first 3 frames
+                    debug_dir = os.path.join(output_path, "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    
+                    # Save original frame crop
+                    cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_original_crop.jpg"), ori_frame[y1:y2, x1:x2])
+                    
+                    # Save generated result
+                    cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_generated.jpg"), res_frame)
+                    
+                    # Save resized generated result
+                    target_width = x2 - x1
+                    target_height = y2 - y1
+                    res_frame_resized = cv2.resize(decoded_img.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
+                    cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_generated_resized.jpg"), res_frame_resized)
+                
                 if self.version == "v15":
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode='jaw', fp=self.fp)
+                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], upper_boundary_ratio=0.5, expand=1.8, mode='jaw', fp=self.fp, debug_dir=debug_dir, frame_idx=frame_idx)
                 else:
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=self.fp)
+                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], upper_boundary_ratio=0.5, expand=1.7, fp=self.fp, debug_dir=debug_dir, frame_idx=frame_idx)
+                
+                # Debug: Save blended result
+                if frame_idx < 3:
+                    cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_blended.jpg"), combine_frame)
                 
                 res_frame_list.append(combine_frame)
                 

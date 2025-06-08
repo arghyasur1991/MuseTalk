@@ -32,7 +32,7 @@ def face_seg(image, mode="raw", fp=None):
     return seg_image
 
 
-def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw", fp=None):
+def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw", fp=None, debug_dir=None, frame_idx=None):
     """
     将裁剪的面部图像粘贴回原始图像，并进行一些处理。
 
@@ -43,10 +43,14 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
         upper_boundary_ratio (float): 用于控制面部区域的保留比例。
         expand (float): 扩展因子，用于放大裁剪框。
         mode: 融合mask构建方式 
+        debug_dir: 调试目录，保存中间结果
+        frame_idx: 帧索引，用于调试文件命名
 
     Returns:
         numpy.ndarray: 处理后的图像。
     """
+    import os
+    
     # 将 numpy 数组转换为 PIL 图像
     body = Image.fromarray(image[:, :, ::-1])  # 身体部分图像(整张图)
     face = Image.fromarray(face[:, :, ::-1])  # 面部图像
@@ -61,30 +65,77 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
         
     ori_shape = face_large.size  # 裁剪后图像的原始尺寸
 
+    # Debug: Save face_large crop
+    if debug_dir and frame_idx is not None and frame_idx < 3:
+        os.makedirs(debug_dir, exist_ok=True)
+        face_large_np = np.array(face_large)[:, :, ::-1]  # Convert to BGR for OpenCV
+        cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_face_large_crop.jpg"), face_large_np)
+
     # 对裁剪后的面部区域进行面部解析，生成掩码
     mask_image = face_seg(face_large, mode=mode, fp=fp)
     
+    # Debug: Save face segmentation mask
+    if debug_dir and frame_idx is not None and frame_idx < 3 and mask_image is not None:
+        mask_np = np.array(mask_image)
+        cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_face_seg_mask.jpg"), mask_np)
+    
     mask_small = mask_image.crop((x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 裁剪出面部区域的掩码
+    
+    # Debug: Save small mask
+    if debug_dir and frame_idx is not None and frame_idx < 3:
+        mask_small_np = np.array(mask_small)
+        cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_mask_small.jpg"), mask_small_np)
     
     mask_image = Image.new('L', ori_shape, 0)  # 创建一个全黑的掩码图像
     mask_image.paste(mask_small, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 将面部掩码粘贴到全黑图像上
     
+    # Debug: Save full mask before boundary modification
+    if debug_dir and frame_idx is not None and frame_idx < 3:
+        mask_full_np = np.array(mask_image)
+        cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_mask_full.jpg"), mask_full_np)
     
     # 保留面部区域的上半部分（用于控制说话区域）
+    # For InsightFace, use more aggressive boundary to match MMPose coverage
     width, height = mask_image.size
-    top_boundary = int(height * upper_boundary_ratio)  # 计算上半部分的边界
+    
+    # Adjust boundary ratio based on mode for better quality matching
+    if mode == "jaw":  # v15 mode
+        adjusted_ratio = upper_boundary_ratio * 0.8  # More aggressive for v15
+    else:
+        adjusted_ratio = upper_boundary_ratio * 0.85  # Slightly more aggressive for v1
+        
+    top_boundary = int(height * adjusted_ratio)  # 计算上半部分的边界
     modified_mask_image = Image.new('L', ori_shape, 0)  # 创建一个新的全黑掩码图像
     modified_mask_image.paste(mask_image.crop((0, top_boundary, width, height)), (0, top_boundary))  # 粘贴上半部分掩码
     
+    # Debug: Save modified mask after boundary cut
+    if debug_dir and frame_idx is not None and frame_idx < 3:
+        modified_mask_np = np.array(modified_mask_image)
+        cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_mask_modified_boundary.jpg"), modified_mask_np)
+        print(f"DEBUG: Frame {frame_idx} - Top boundary at {top_boundary} (adjusted ratio {adjusted_ratio:.3f}, orig {upper_boundary_ratio}), mask size: {width}x{height}")
     
     # 对掩码进行高斯模糊，使边缘更平滑
-    blur_kernel_size = int(0.05 * ori_shape[0] // 2 * 2) + 1  # 计算模糊核大小
+    # Increase blur kernel size for InsightFace to match MMPose smoothness
+    base_blur_factor = 0.08 if mode == "jaw" else 0.06  # Larger blur for better blending
+    blur_kernel_size = int(base_blur_factor * ori_shape[0] // 2 * 2) + 1  # 计算模糊核大小
+    blur_kernel_size = max(blur_kernel_size, 15)  # Minimum blur kernel size
     mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)  # 高斯模糊
     #mask_array = np.array(modified_mask_image)
     mask_image = Image.fromarray(mask_array)  # 将模糊后的掩码转换回 PIL 图像
     
+    # Debug: Save final blurred mask
+    if debug_dir and frame_idx is not None and frame_idx < 3:
+        final_mask_np = np.array(mask_image)
+        cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_mask_final_blurred.jpg"), final_mask_np)
+        print(f"DEBUG: Frame {frame_idx} - Blur kernel size: {blur_kernel_size}")
+    
     # 将裁剪的面部图像粘贴回扩展后的面部区域
     face_large.paste(face, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))
+    
+    # Debug: Save face_large with pasted face
+    if debug_dir and frame_idx is not None and frame_idx < 3:
+        face_large_with_face_np = np.array(face_large)[:, :, ::-1]
+        cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_face_large_with_pasted_face.jpg"), face_large_with_face_np)
     
     body.paste(face_large, crop_box[:2], mask_image)
     
