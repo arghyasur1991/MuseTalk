@@ -500,7 +500,7 @@ class ONNXMuseTalkInference:
         
         return pred_latents
         
-    def inference(self, avatar_path, audio_path, output_path, batch_size=4, max_images=10):
+    def inference(self, avatar_path, audio_path, output_path, batch_size=4, max_images=10, use_insightface=True):
         """Main inference function matching PyTorch implementation exactly"""
         start_time = time.time()
         
@@ -517,8 +517,9 @@ class ONNXMuseTalkInference:
         print(f"Processing {len(input_img_list)} avatar images")
         
         # Get face landmarks and bounding boxes
-        print("Extracting face landmarks...")
-        coord_list, frame_list = get_landmark_and_bbox(input_img_list, upperbondrange=0)
+        backend_name = "InsightFace" if use_insightface else "MMPose"
+        print(f"Extracting face landmarks with {backend_name}...")
+        coord_list, frame_list = get_landmark_and_bbox(input_img_list, upperbondrange=0, use_insightface=use_insightface)
         
         # Process images to get latents
         print("Encoding avatar images...")
@@ -677,6 +678,8 @@ def main():
     parser.add_argument("--device", default="cpu", help="Device (cpu/cuda)")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--max_images", type=int, default=10, help="Max images for debugging (0 for all)")
+    parser.add_argument("--use_insightface", action="store_true", default=True, help="Use InsightFace models for face detection/landmarking")
+    parser.add_argument("--use_mmpose", action="store_true", help="Use MMPose models for face detection/landmarking (fallback)")
     
     args = parser.parse_args()
     
@@ -687,13 +690,17 @@ def main():
         device=args.device
     )
     
+    # Determine which backend to use
+    use_insightface_models = args.use_insightface and not args.use_mmpose
+    
     # Run inference
     inference_engine.inference(
         avatar_path=args.avatar_path,
         audio_path=args.audio_path,
         output_path=args.output_path,
         batch_size=args.batch_size,
-        max_images=args.max_images
+        max_images=args.max_images,
+        use_insightface=use_insightface_models
     )
 
 if __name__ == "__main__":
