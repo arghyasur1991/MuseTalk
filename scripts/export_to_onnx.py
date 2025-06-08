@@ -53,6 +53,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from musetalk.utils.utils import load_all_model
 from musetalk.models.unet import PositionalEncoding
 from transformers import WhisperModel
+from musetalk.utils.face_parsing import FaceParsing
 
 def export_unet_to_onnx(unet, output_path, opset_version=18, device='cpu'):
     """Export UNet model to ONNX format with external data support"""
@@ -367,19 +368,17 @@ def export_positional_encoding_to_onnx(pe_model, output_path, device="cpu", opse
     return True
 
 def export_whisper_to_onnx(whisper_model, output_path, device="cpu", opset_version=18):
-    """Export Whisper model to ONNX"""
-    print(f"Exporting Whisper to {output_path} with opset {opset_version}")
+    """Export Whisper encoder to ONNX with ALL hidden states stacked (fixed for Python compatibility)"""
+    print(f"Exporting Whisper to {output_path}")
     
-    # Convert path to string
-    output_path = str(output_path)
-
-    whisper_model.eval()
+    whisper_model = whisper_model.to(device).eval()
     
-    # Create dummy input for audio features
+    # Standard Whisper input: [batch_size, 80, 3000] for mel spectrogram
     batch_size = 1
-    seq_len = 3000  # Typical whisper input length
-    feature_dim = 80   # Mel spectrogram features
+    feature_dim = 80
+    seq_len = 3000
     
+    # Create dummy input matching Whisper's expected format
     dummy_input = torch.randn(batch_size, feature_dim, seq_len).to(device)
     
     # Create a wrapper for whisper encoder
@@ -418,6 +417,108 @@ def export_whisper_to_onnx(whisper_model, output_path, device="cpu", opset_versi
     print(f"Whisper exported successfully to {output_path}")
     return True
 
+def export_face_parsing_to_onnx(fp_model, output_path, device="cpu", opset_version=18):
+    """Export BiSeNet face parsing model to ONNX format with fixed input size"""
+    print(f"Exporting Face Parsing (BiSeNet) to {output_path}")
+    
+    # Access the actual BiSeNet model from FaceParsing wrapper
+    bisenet_model = fp_model.net.to(device).eval()
+    
+    # Face parsing expects 512x512 RGB input (normalized)
+    batch_size = 1
+    channels = 3
+    height = 512
+    width = 512
+    
+    # Create dummy input (already normalized like FaceParsing preprocessing)
+    dummy_input = torch.randn(batch_size, channels, height, width).to(device)
+    
+    # Create an ONNX-friendly wrapper that fixes the interpolation issue
+    class ONNXFriendlyFaceParsingWrapper(torch.nn.Module):
+        def __init__(self, bisenet_model):
+            super().__init__()
+            self.bisenet = bisenet_model
+            
+        def forward(self, x):
+            # BiSeNet forward pass but with fixed input size to avoid dynamic shape issues
+            # Assuming input is always 512x512 for face parsing
+            H, W = 512, 512  # Fixed input size
+            
+            # Get features from context path  
+            feat_res8, feat_cp8, feat_cp16 = self.bisenet.cp(x)
+            
+            # Use res3b1 feature to replace spatial path feature
+            feat_sp = feat_res8
+            
+            # Feature fusion
+            feat_fuse = self.bisenet.ffm(feat_sp, feat_cp8)
+            
+            # Get outputs
+            feat_out = self.bisenet.conv_out(feat_fuse)
+            feat_out16 = self.bisenet.conv_out16(feat_cp8)
+            feat_out32 = self.bisenet.conv_out32(feat_cp16)
+            
+            # Fixed interpolation to 512x512 (since input is always 512x512)
+            import torch.nn.functional as F
+            feat_out = F.interpolate(feat_out, size=(512, 512), mode='bilinear', align_corners=True)
+            feat_out16 = F.interpolate(feat_out16, size=(512, 512), mode='bilinear', align_corners=True)
+            feat_out32 = F.interpolate(feat_out32, size=(512, 512), mode='bilinear', align_corners=True)
+            
+            # Return only the main output for face parsing
+            return feat_out  # [batch, 19, 512, 512] - 19 face parsing classes
+    
+    fp_wrapper = ONNXFriendlyFaceParsingWrapper(bisenet_model).to(device)
+    
+    # Export to ONNX with more stable options
+    try:
+        # Use TorchScript tracing first for better ONNX compatibility
+        with torch.no_grad():
+            traced_model = torch.jit.trace(fp_wrapper, dummy_input)
+        
+        torch.onnx.export(
+            traced_model,
+            dummy_input,
+            output_path,
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=False,  # Disable to avoid dynamic shape issues
+            input_names=['image'],
+            output_names=['face_parsing_output'],
+            # Remove dynamic axes since we're fixing the input size
+            verbose=False,
+            training=torch.onnx.TrainingMode.EVAL
+        )
+        
+        print(f"Face Parsing exported successfully to {output_path}")
+        return True
+        
+    except Exception as e:
+        print(f"Failed to export Face Parsing model with tracing, trying direct export: {e}")
+        
+        # Fallback to direct export without tracing
+        try:
+            fp_wrapper = ONNXFriendlyFaceParsingWrapper(bisenet_model).to(device)
+            
+            torch.onnx.export(
+                fp_wrapper,
+                dummy_input,
+                output_path,
+                export_params=True,
+                opset_version=11,  # Use older opset for better compatibility
+                do_constant_folding=False,
+                input_names=['image'],
+                output_names=['face_parsing_output'],
+                verbose=False,
+                training=torch.onnx.TrainingMode.EVAL
+            )
+            
+            print(f"Face Parsing exported successfully to {output_path} (fallback mode)")
+            return True
+            
+        except Exception as e2:
+            print(f"Failed to export Face Parsing model (both methods): {e2}")
+            return False
+
 def verify_onnx_model(onnx_path, input_shapes=None):
     """Verify the exported ONNX model"""
     print(f"Verifying ONNX model: {onnx_path}")
@@ -453,7 +554,7 @@ def main():
     parser.add_argument("--device", default="cpu", 
                        help="Device to use for export (cpu/cuda)")
     parser.add_argument("--models", nargs="+", 
-                       choices=["unet", "vae_encoder", "vae_decoder", "pe", "whisper", "all"],
+                       choices=["unet", "vae_encoder", "vae_decoder", "pe", "whisper", "face_parsing", "all"],
                        default=["all"], help="Models to export")
     parser.add_argument("--opset_version", type=int, default=18,
                        help="ONNX opset version to use (11-18)")
@@ -481,7 +582,7 @@ def main():
     
     models_to_export = args.models
     if "all" in models_to_export:
-        models_to_export = ["unet", "vae_encoder", "vae_decoder", "pe", "whisper"]
+        models_to_export = ["unet", "vae_encoder", "vae_decoder", "pe", "whisper", "face_parsing"]
     
     try:
         # Load MuseTalk models
@@ -503,6 +604,16 @@ def main():
             print("Whisper model not found, skipping...")
             if "whisper" in models_to_export:
                 models_to_export.remove("whisper")
+        
+        # Load Face Parsing model
+        if "face_parsing" in models_to_export:
+            try:
+                print("Loading Face Parsing (BiSeNet) model...")
+                fp = FaceParsing()
+                print("Face Parsing model loaded successfully")
+            except Exception as e:
+                print(f"Face Parsing model not found or failed to load: {e}")
+                models_to_export.remove("face_parsing")
         
         # Export models
         success_count = 0
@@ -551,6 +662,15 @@ def main():
                         success_count += 1
             except Exception as e:
                 print(f"Failed to export Whisper: {e}")
+        
+        if "face_parsing" in models_to_export and 'fp' in locals():
+            face_parsing_path = output_dir / "face_parsing.onnx"
+            try:
+                if export_face_parsing_to_onnx(fp, face_parsing_path, device, args.opset_version):
+                    if verify_onnx_model(face_parsing_path):
+                        success_count += 1
+            except Exception as e:
+                print(f"Failed to export Face Parsing: {e}")
         
         print(f"\n✓ Successfully exported {success_count} models to ONNX format")
         print(f"Output directory: {output_dir}")

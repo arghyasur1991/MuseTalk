@@ -34,12 +34,10 @@ class ONNXMuseTalkInference:
         # Set up ONNX Runtime providers
         self.providers = self._get_providers()
         
-        # Initialize face parsing model
+        # Initialize face parsing - will try ONNX first, fallback to PyTorch
         print("Initializing face parsing model...")
-        if version == "v15":
-            self.fp = FaceParsing()  # v15 uses default parameters
-        else:
-            self.fp = FaceParsing()  # v1 also uses default for now
+        self.fp = None
+        self.fp_session = None
         
         # Load ONNX models
         self.load_models()
@@ -129,6 +127,22 @@ class ONNXMuseTalkInference:
         except Exception as e:
             print(f"✗ Failed to load Whisper ONNX: {e}")
             self.has_whisper_onnx = False
+        
+        # Load Face Parsing ONNX model (priority) or fallback to PyTorch
+        face_parsing_path = self.model_dir / "face_parsing.onnx"
+        try:
+            print(f"Loading Face Parsing ONNX from {face_parsing_path}")
+            self.fp_session = ort.InferenceSession(str(face_parsing_path), providers=self.providers, session_options=self._get_session_options())
+            print("✓ Face Parsing ONNX loaded successfully")
+        except Exception as e:
+            print(f"✗ Failed to load Face Parsing ONNX: {e}")
+            print("Falling back to PyTorch Face Parsing model...")
+            try:
+                self.fp = FaceParsing()
+                print("✓ PyTorch Face Parsing loaded successfully")
+            except Exception as e2:
+                print(f"✗ Failed to load PyTorch Face Parsing: {e2}")
+                self.fp = None
             
         print("All ONNX models loaded successfully!")
         
@@ -500,6 +514,45 @@ class ONNXMuseTalkInference:
         
         return pred_latents
         
+    def run_face_parsing(self, image):
+        """Run face parsing inference using ONNX or PyTorch"""
+        if self.fp_session is not None:
+            # Use ONNX face parsing
+            # Prepare image for ONNX model (512x512 RGB)
+            if image.shape[0] != 512 or image.shape[1] != 512:
+                image = cv2.resize(image, (512, 512))
+            
+            # Convert BGR to RGB and normalize
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image_norm = image_rgb.astype(np.float32) / 255.0
+            
+            # Apply ImageNet normalization
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            image_norm = (image_norm - mean) / std
+            
+            # Convert to tensor format [1, 3, 512, 512]
+            image_tensor = np.transpose(image_norm, (2, 0, 1))
+            image_tensor = np.expand_dims(image_tensor, 0)
+            
+            # Run ONNX inference
+            parsing_output = self.fp_session.run(
+                ['face_parsing_output'],
+                {'image': image_tensor.astype(np.float32)}
+            )[0]
+            
+            # Convert output to segmentation mask [512, 512]
+            parsing_map = np.argmax(parsing_output[0], axis=0)
+            return parsing_map
+            
+        elif self.fp is not None:
+            # Use PyTorch face parsing (fallback)
+            return self.fp.get_mask(image)
+        else:
+            # No face parsing available, return dummy mask
+            print("Warning: No face parsing model available, using dummy mask")
+            return np.ones((512, 512), dtype=np.uint8)
+        
     def inference(self, avatar_path, audio_path, output_path, batch_size=4, max_images=10, use_insightface=True):
         """Main inference function matching PyTorch implementation exactly"""
         start_time = time.time()
@@ -632,10 +685,63 @@ class ONNXMuseTalkInference:
                     res_frame_resized = cv2.resize(decoded_img.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
                     cv2.imwrite(os.path.join(debug_dir, f"frame_{frame_idx:03d}_generated_resized.jpg"), res_frame_resized)
                 
+                # Create a wrapper for ONNX face parsing that mimics FaceParsing interface
+                class FaceParsingWrapper:
+                    def __init__(self, inference_engine):
+                        self.engine = inference_engine
+                    
+                    def get_mask(self, image):
+                        return self.engine.run_face_parsing(image)
+                    
+                    def __call__(self, image, size=(512, 512), mode="raw"):
+                        """Make wrapper callable like original FaceParsing class"""
+                        # Convert input image if it's a path string
+                        if isinstance(image, str):
+                            import cv2
+                            image = cv2.imread(image)
+                        
+                        # If it's a PIL Image, convert to OpenCV format
+                        if hasattr(image, 'size'):
+                            import numpy as np
+                            image = np.array(image)
+                            if image.shape[2] == 3:  # RGB to BGR
+                                image = image[:, :, ::-1]
+                        
+                        # Get face parsing mask using ONNX
+                        parsing = self.engine.run_face_parsing(image)
+                        
+                        # Apply mode processing like original FaceParsing
+                        if mode == "neck":
+                            parsing[np.isin(parsing, [1, 11, 12, 13, 14])] = 255
+                            parsing[np.where(parsing!=255)] = 0
+                        elif mode == "jaw":
+                            # For jaw mode, include face and mouth regions
+                            face_region = np.isin(parsing, [1])*255
+                            face_region = face_region.astype(np.uint8)
+                            
+                            # Simple dilation and erosion (without complex kernels for now)
+                            import cv2
+                            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                            face_region = cv2.dilate(face_region, kernel, iterations=1)
+                            face_region = cv2.erode(face_region, kernel, iterations=1)
+                            
+                            parsing[(face_region==255) & (~np.isin(parsing, [10]))] = 255         
+                            parsing[np.isin(parsing, [11, 12, 13])] = 255  # Include mouth regions
+                            parsing[np.where(parsing!=255)] = 0
+                        else:  # raw mode
+                            parsing[np.isin(parsing, [1, 11, 12, 13])] = 255
+                            parsing[np.where(parsing!=255)] = 0
+                        
+                        # Convert to PIL Image like original
+                        from PIL import Image
+                        return Image.fromarray(parsing.astype(np.uint8))
+                
+                fp_wrapper = FaceParsingWrapper(self)
+                
                 if self.version == "v15":
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], upper_boundary_ratio=0.5, expand=1.8, mode='jaw', fp=self.fp, debug_dir=debug_dir, frame_idx=frame_idx)
+                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], upper_boundary_ratio=0.5, expand=1.8, mode='jaw', fp=fp_wrapper, debug_dir=debug_dir, frame_idx=frame_idx)
                 else:
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], upper_boundary_ratio=0.5, expand=1.7, fp=self.fp, debug_dir=debug_dir, frame_idx=frame_idx)
+                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], upper_boundary_ratio=0.5, expand=1.7, fp=fp_wrapper, debug_dir=debug_dir, frame_idx=frame_idx)
                 
                 # Debug: Save blended result
                 if frame_idx < 3:
