@@ -699,7 +699,7 @@ def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_typ
         model_size = os.path.getsize(fp32_model_path)
         # Use much higher threshold since quantized models are typically 3-4x smaller
         # Only really large models (like UNet ~130MB+ FP32) should use external data
-        use_external_data = model_size > 1024 * 1024 * 200  # > 200MB threshold
+        use_external_data =model_type == "unet" or (model_size > 1024 * 1024 * 200)  # > 200MB threshold
         
         if use_external_data:
             print(f"Large model detected ({model_size / 1024 / 1024:.1f}MB), using external data format")
