@@ -865,8 +865,8 @@ def export_model_with_quantization(export_func, model, output_path, model_name, 
     # Skip INT8 only for VAE decoder (most sensitive to quality loss)
     # VAE encoder can handle INT8 better, so we'll export both versions
     if model_type == "vae_decoder":
-        print(f"⚠️ Skipping INT8 quantization for {model_name} to preserve image quality")
-        export_int8 = False
+        print(f"✓ Exporting both FP32 and INT8 for {model_name} (runtime will choose best)")
+        # export_int8 = False
     elif model_type == "vae_encoder":
         print(f"✓ Exporting both FP32 and INT8 for {model_name} (runtime will choose best)")
         # export_int8 remains True
