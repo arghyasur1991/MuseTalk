@@ -694,10 +694,12 @@ def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_typ
         # Create calibration data reader
         calibration_reader = DummyCalibrationDataReader(fp32_model_path)
         
-        # Determine if we need external data format (only for large models > 2GB)
+        # Determine if we need external data format (conservative threshold for quantized models)
         import os
         model_size = os.path.getsize(fp32_model_path)
-        use_external_data = model_size > 1024 * 1024 * 100  # > 100MB threshold
+        # Use much higher threshold since quantized models are typically 3-4x smaller
+        # Only really large models (like UNet ~130MB+ FP32) should use external data
+        use_external_data = model_size > 1024 * 1024 * 200  # > 200MB threshold
         
         if use_external_data:
             print(f"Large model detected ({model_size / 1024 / 1024:.1f}MB), using external data format")
@@ -738,7 +740,7 @@ def convert_model_to_int8_alternative(fp32_model_path, int8_model_path, model_ty
         
         # Fallback to minimal dynamic quantization
         model_size = os.path.getsize(fp32_model_path)
-        use_external_data = model_size > 1024 * 1024 * 100  # > 100MB threshold
+        use_external_data = model_size > 1024 * 1024 * 200  # > 200MB threshold (conservative for quantized models)
         
         quantize_dynamic(
             model_input=fp32_model_path,
@@ -797,11 +799,12 @@ def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
     source_path = Path(source_dir)
     copied_files = []
     
-    # Models to copy (FP32 and INT8 versions, except VAE models stay FP32 for quality)
+    # Models to copy (FP32 and INT8 versions, VAE decoder FP32 only for quality)
     models_to_copy = [
         f"unet{model_suffix}.onnx",
         f"unet{model_suffix}_int8.onnx",
-        f"vae_encoder{model_suffix}.onnx",  # FP32 only for quality
+        f"vae_encoder{model_suffix}.onnx",  # FP32 version
+        f"vae_encoder{model_suffix}_int8.onnx",  # INT8 version for performance testing
         f"vae_decoder{model_suffix}.onnx",  # FP32 only for quality
         f"positional_encoding{model_suffix}.onnx",
         f"positional_encoding{model_suffix}_int8.onnx",
@@ -812,7 +815,7 @@ def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
         f"onnx_config{model_suffix}.json"
     ]
     
-    # Copy external data files for large models (UNet)
+    # Copy external data files for large models (only UNet needs external data now)
     external_data_files = [
         f"unet{model_suffix}.onnx.data",
         f"unet{model_suffix}_int8.onnx.data"
@@ -859,10 +862,14 @@ def export_model_with_quantization(export_func, model, output_path, model_name, 
     # Extract model type for INT8 quantization
     model_type = model_name.lower().replace(" ", "_")
     
-    # Skip INT8 for VAE models to preserve image quality
-    if model_type in ["vae_encoder", "vae_decoder"]:
+    # Skip INT8 only for VAE decoder (most sensitive to quality loss)
+    # VAE encoder can handle INT8 better, so we'll export both versions
+    if model_type == "vae_decoder":
         print(f"⚠️ Skipping INT8 quantization for {model_name} to preserve image quality")
         export_int8 = False
+    elif model_type == "vae_encoder":
+        print(f"✓ Exporting both FP32 and INT8 for {model_name} (runtime will choose best)")
+        # export_int8 remains True
     
     # Export FP32 model
     try:
