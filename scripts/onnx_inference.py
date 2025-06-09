@@ -26,13 +26,20 @@ from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
 
 class ONNXMuseTalkInference:
-    def __init__(self, model_dir="./models/onnx", version="v15", device="cpu"):
+    def __init__(self, model_dir="./models/onnx", version="v15", device="cpu", use_int8=True):
         self.model_dir = Path(model_dir)
         self.version = version
         self.device = device
+        self.use_int8 = use_int8
         
         # Set up ONNX Runtime providers
         self.providers = self._get_providers()
+        
+        # Validate quantization options
+        if self.use_int8:
+            print("🍎 Using INT8 quantization - optimal for CPU inference")
+        else:
+            print("📝 Using FP32 models")
         
         # Initialize face parsing - will try ONNX first, fallback to PyTorch
         print("Initializing face parsing model...")
@@ -43,31 +50,46 @@ class ONNXMuseTalkInference:
         self.load_models()
         
     def _get_providers(self):
-        """Get available ONNX Runtime providers with optimized settings"""
+        """Get available ONNX Runtime providers optimized for CPU/INT8"""
         providers = []
         
-        # For large models like UNet, CoreML may fail, so prefer CPU for stability
         # Check for CUDA first if requested
-        if 'CUDAExecutionProvider' in ort.get_available_providers() and self.device == "cuda":
-            providers.append('CUDAExecutionProvider')
+        if 'CUDAExecutionProvider' in ort.get_available_providers() and self.device in ["cuda", "gpu"]:
+            cuda_options = {
+                'device_id': 0,
+                'arena_extend_strategy': 'kSameAsRequested',
+                'gpu_mem_limit': 0,  # Use all available GPU memory
+                'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                'do_copy_in_default_stream': True,
+            }
+            providers.append(('CUDAExecutionProvider', cuda_options))
+            print("✓ CUDA provider configured")
             
-        # Always add CPU as it's most compatible
+        elif 'DmlExecutionProvider' in ort.get_available_providers() and self.device in ["cuda", "gpu", "dml"]:
+            providers.append(('DmlExecutionProvider', {}))
+            print("✓ DirectML provider configured")
+            
+        # Always add CPU as fallback (optimal for INT8)
         providers.append('CPUExecutionProvider')
         
-        print(f"Using ONNX providers: {providers}")
+        print(f"Using ONNX providers: {[p[0] if isinstance(p, tuple) else p for p in providers]}")
         return providers
         
     def _get_session_options(self):
-        """Get optimized session options for higher precision"""
+        """Get optimized session options for INT8/CPU inference"""
         session_options = ort.SessionOptions()
         
-        # Disable optimizations that might affect precision
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        if self.use_int8:
+            # Enable optimizations for INT8 quantized models
+            print("Enabling INT8 optimizations in ONNX Runtime...")
+            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            session_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+        else:
+            # FP32 optimizations with conservative settings
+            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+            session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         
-        # Enable sequential execution for deterministic results
-        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        
-        # Set high precision mode
+        # Common optimizations
         session_options.add_session_config_entry("session.use_env_allocators", "1")
         
         return session_options
@@ -79,13 +101,13 @@ class ONNXMuseTalkInference:
         # Model file paths - use regular optimized models
         model_suffix = f"_{self.version}" if self.version != "v1.0" else ""
         
-        unet_path = self.model_dir / f"unet{model_suffix}.onnx"
-        vae_encoder_path = self.model_dir / f"vae_encoder{model_suffix}.onnx"
-        vae_decoder_path = self.model_dir / f"vae_decoder{model_suffix}.onnx"
-        pe_path = self.model_dir / f"positional_encoding{model_suffix}.onnx"
-        whisper_path = self.model_dir / "whisper_encoder.onnx"
+        unet_path = self._get_model_path("unet", model_suffix)
+        vae_encoder_path = self._get_model_path("vae_encoder", model_suffix)
+        vae_decoder_path = self._get_model_path("vae_decoder", model_suffix)
+        pe_path = self._get_model_path("positional_encoding", model_suffix)
+        whisper_path = self._get_model_path("whisper_encoder")
         
-        # Load models with error handling
+        # Load models with error handling and INT8 fallback
         try:
             print(f"Loading UNet from {unet_path}")
             self.unet_session = ort.InferenceSession(str(unet_path), providers=self.providers, session_options=self._get_session_options())
@@ -94,31 +116,67 @@ class ONNXMuseTalkInference:
             print(f"✗ Failed to load UNet: {e}")
             raise
             
+        # VAE Encoder with INT8 fallback
         try:
             print(f"Loading VAE Encoder from {vae_encoder_path}")
             self.vae_encoder_session = ort.InferenceSession(str(vae_encoder_path), providers=self.providers, session_options=self._get_session_options())
             print("✓ VAE Encoder loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load VAE Encoder: {e}")
-            raise
+            if "ConvInteger" in str(e) and "_int8" in str(vae_encoder_path):
+                print("💡 INT8 ConvInteger not supported on this platform, falling back to FP32...")
+                fallback_path = str(vae_encoder_path).replace("_int8", "")
+                print(f"Trying FP32 fallback: {fallback_path}")
+                try:
+                    self.vae_encoder_session = ort.InferenceSession(fallback_path, providers=self.providers, session_options=self._get_session_options())
+                    print("✓ VAE Encoder loaded successfully (FP32 fallback)")
+                except Exception as e2:
+                    print(f"✗ FP32 fallback also failed: {e2}")
+                    raise
+            else:
+                raise
             
+        # VAE Decoder with INT8 fallback
         try:
             print(f"Loading VAE Decoder from {vae_decoder_path}")
             self.vae_decoder_session = ort.InferenceSession(str(vae_decoder_path), providers=self.providers, session_options=self._get_session_options())
             print("✓ VAE Decoder loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load VAE Decoder: {e}")
-            raise
+            if "ConvInteger" in str(e) and "_int8" in str(vae_decoder_path):
+                print("💡 INT8 ConvInteger not supported on this platform, falling back to FP32...")
+                fallback_path = str(vae_decoder_path).replace("_int8", "")
+                print(f"Trying FP32 fallback: {fallback_path}")
+                try:
+                    self.vae_decoder_session = ort.InferenceSession(fallback_path, providers=self.providers, session_options=self._get_session_options())
+                    print("✓ VAE Decoder loaded successfully (FP32 fallback)")
+                except Exception as e2:
+                    print(f"✗ FP32 fallback also failed: {e2}")
+                    raise
+            else:
+                raise
             
+        # Positional Encoding with INT8 fallback
         try:
             print(f"Loading Positional Encoding from {pe_path}")
             self.pe_session = ort.InferenceSession(str(pe_path), providers=self.providers, session_options=self._get_session_options())
             print("✓ Positional Encoding loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load Positional Encoding: {e}")
-            raise
-            
-        # Load Whisper ONNX model
+            if "ConvInteger" in str(e) and "_int8" in str(pe_path):
+                print("💡 INT8 operations not supported on this platform, falling back to FP32...")
+                fallback_path = str(pe_path).replace("_int8", "")
+                print(f"Trying FP32 fallback: {fallback_path}")
+                try:
+                    self.pe_session = ort.InferenceSession(fallback_path, providers=self.providers, session_options=self._get_session_options())
+                    print("✓ Positional Encoding loaded successfully (FP32 fallback)")
+                except Exception as e2:
+                    print(f"✗ FP32 fallback also failed: {e2}")
+                    raise
+            else:
+                raise
+        
+        # Load Whisper ONNX model with INT8 fallback
         try:
             print(f"Loading Whisper ONNX from {whisper_path}")
             self.whisper_session = ort.InferenceSession(str(whisper_path), providers=self.providers, session_options=self._get_session_options())
@@ -126,26 +184,74 @@ class ONNXMuseTalkInference:
             self.has_whisper_onnx = True
         except Exception as e:
             print(f"✗ Failed to load Whisper ONNX: {e}")
-            self.has_whisper_onnx = False
+            if "ConvInteger" in str(e) and "_int8" in str(whisper_path):
+                print("💡 INT8 operations not supported on this platform, falling back to FP32...")
+                fallback_path = str(whisper_path).replace("_int8", "")
+                print(f"Trying FP32 fallback: {fallback_path}")
+                try:
+                    self.whisper_session = ort.InferenceSession(fallback_path, providers=self.providers, session_options=self._get_session_options())
+                    print("✓ Whisper ONNX loaded successfully (FP32 fallback)")
+                    self.has_whisper_onnx = True
+                except Exception as e2:
+                    print(f"✗ FP32 fallback also failed: {e2}")
+                    self.has_whisper_onnx = False
+            else:
+                self.has_whisper_onnx = False
         
         # Load Face Parsing ONNX model (priority) or fallback to PyTorch
-        face_parsing_path = self.model_dir / "face_parsing.onnx"
+        face_parsing_path = self._get_model_path("face_parsing")
         try:
             print(f"Loading Face Parsing ONNX from {face_parsing_path}")
             self.fp_session = ort.InferenceSession(str(face_parsing_path), providers=self.providers, session_options=self._get_session_options())
             print("✓ Face Parsing ONNX loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load Face Parsing ONNX: {e}")
-            print("Falling back to PyTorch Face Parsing model...")
-            try:
-                self.fp = FaceParsing()
-                print("✓ PyTorch Face Parsing loaded successfully")
-            except Exception as e2:
-                print(f"✗ Failed to load PyTorch Face Parsing: {e2}")
-                self.fp = None
+            if "ConvInteger" in str(e) and "_int8" in str(face_parsing_path):
+                print("💡 INT8 operations not supported on this platform, falling back to FP32...")
+                fallback_path = str(face_parsing_path).replace("_int8", "")
+                print(f"Trying FP32 fallback: {fallback_path}")
+                try:
+                    self.fp_session = ort.InferenceSession(fallback_path, providers=self.providers, session_options=self._get_session_options())
+                    print("✓ Face Parsing ONNX loaded successfully (FP32 fallback)")
+                except Exception as e2:
+                    print(f"✗ FP32 fallback also failed: {e2}")
+                    print("Falling back to PyTorch Face Parsing model...")
+                    try:
+                        self.fp = FaceParsing()
+                        print("✓ PyTorch Face Parsing loaded successfully")
+                    except Exception as e3:
+                        print(f"✗ Failed to load PyTorch Face Parsing: {e3}")
+                        self.fp = None
+            else:
+                print("Falling back to PyTorch Face Parsing model...")
+                try:
+                    self.fp = FaceParsing()
+                    print("✓ PyTorch Face Parsing loaded successfully")
+                except Exception as e2:
+                    print(f"✗ Failed to load PyTorch Face Parsing: {e2}")
+                    self.fp = None
             
         print("All ONNX models loaded successfully!")
         
+
+        
+    def _get_model_path(self, base_name, model_suffix=""):
+        """Get model path with INT8 quantization support"""
+        
+        # Priority: INT8 for CPU optimization > FP32 fallback
+        if self.use_int8:
+            int8_path = self.model_dir / f"{base_name}{model_suffix}_int8.onnx"
+            if int8_path.exists():
+                print(f"Using INT8 model: {int8_path}")
+                return int8_path
+            else:
+                print(f"⚠️ INT8 model not found: {int8_path}, falling back to FP32")
+        
+        # Fallback to FP32 model
+        fp32_path = self.model_dir / f"{base_name}{model_suffix}.onnx"
+        print(f"Using FP32 model: {fp32_path}")
+        return fp32_path
+    
     def extract_mel_spectrogram(self, audio_path):
         """Extract mel spectrogram features matching the transformers WhisperFeatureExtractor"""
         print(f"Extracting mel spectrogram from {audio_path}")
@@ -803,20 +909,32 @@ def main():
     parser.add_argument("--output_path", required=True, help="Output directory")
     parser.add_argument("--model_dir", default="./models/onnx", help="ONNX models directory")
     parser.add_argument("--version", default="v15", help="Model version")
-    parser.add_argument("--device", default="cpu", help="Device (cpu/cuda)")
+    parser.add_argument("--device", default="cpu", help="Device (cpu/cuda/gpu)")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--max_images", type=int, default=10, help="Max images for debugging (0 for all)")
     parser.add_argument("--use_insightface", action="store_true", default=True, help="Use InsightFace models for face detection/landmarking")
     parser.add_argument("--use_mmpose", action="store_true", help="Use MMPose models for face detection/landmarking (fallback)")
+    parser.add_argument("--int8", action="store_true", default=True, help="Use INT8 quantized models for inference (CPU-optimized, default: True)")
+    parser.add_argument("--no-int8", action="store_true", help="Force disable INT8 quantization")
     
     args = parser.parse_args()
+    
+    # Handle quantization flags
+    use_int8 = args.int8 and not args.no_int8
     
     # Create inference engine
     inference_engine = ONNXMuseTalkInference(
         model_dir=args.model_dir,
         version=args.version,
-        device=args.device
+        device=args.device,
+        use_int8=use_int8
     )
+    
+    # Log quantization status
+    if inference_engine.use_int8:
+        print("🍎 INT8 quantization enabled - optimized for CPU!")
+    else:
+        print("💾 Using FP32 inference")
     
     # Determine which backend to use
     use_insightface_models = args.use_insightface and not args.use_mmpose

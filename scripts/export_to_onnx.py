@@ -12,6 +12,18 @@ import numpy as np
 import argparse
 import json
 from pathlib import Path
+import shutil
+
+# INT8 quantization support
+try:
+    from onnxruntime.quantization import quantize_dynamic, QuantType
+    from onnxruntime.quantization.calibrate import CalibrationDataReader
+    from onnxruntime.quantization import quantize_static, CalibrationMethod
+    INT8_AVAILABLE = True
+    print("✓ INT8 quantization support available")
+except ImportError:
+    INT8_AVAILABLE = False
+    print("⚠️ INT8 quantization not available. Install with: pip install onnxruntime")
 
 # More aggressive disabling of attention optimizations
 torch.backends.cuda.enable_math_sdp(False)
@@ -55,12 +67,15 @@ from musetalk.models.unet import PositionalEncoding
 from transformers import WhisperModel
 from musetalk.utils.face_parsing import FaceParsing
 
-def export_unet_to_onnx(unet, output_path, opset_version=18, device='cpu'):
+def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
     """Export UNet model to ONNX format with external data support"""
-    print(f"Exporting UNet to {output_path} with opset {opset_version}")
+    print(f"Exporting UNet to {output_path} with opset {device}")
     
     # Convert path to string to handle both string and Path objects
     output_path = str(output_path)
+    
+    # Ensure device is CPU for export to avoid CUDA issues
+    device = torch.device('cpu')
     
     class UNetWrapper(torch.nn.Module):
         def __init__(self, unet_model):
@@ -91,10 +106,11 @@ def export_unet_to_onnx(unet, output_path, opset_version=18, device='cpu'):
             )
             return result[0]  # Return just the noise prediction
     
+    # Ensure model and inputs are on CPU to avoid CUDA issues
     wrapper = UNetWrapper(unet).to(device)
     wrapper.eval()
     
-    # Create dummy inputs matching the expected format
+    # Create dummy inputs matching the expected format (always on CPU for export)
     input_latents = torch.randn(1, 8, 32, 32, device=device)  # Concatenated latents
     timesteps = torch.tensor([0], device=device, dtype=torch.long)
     audio_prompts = torch.randn(1, 50, 384, device=device)
@@ -524,11 +540,18 @@ def verify_onnx_model(onnx_path, input_shapes=None):
     print(f"Verifying ONNX model: {onnx_path}")
     
     try:
-        # Load and check the model
-        onnx_model = onnx.load(onnx_path)
-        onnx.checker.check_model(onnx_model)
+        # For large models with external data, skip the onnx.checker and go straight to runtime
+        file_size = os.path.getsize(onnx_path)
+        is_large_model = file_size > 100 * 1024 * 1024  # > 100MB likely has external data
         
-        # Create ONNX Runtime session
+        if is_large_model:
+            print(f"Large model detected ({file_size / 1024 / 1024:.1f}MB), skipping protobuf check...")
+        else:
+            # Load and check the model (only for smaller models)
+            onnx_model = onnx.load(onnx_path)
+            onnx.checker.check_model(onnx_model)
+        
+        # Create ONNX Runtime session to verify it can load
         providers = ['CPUExecutionProvider']
         if torch.cuda.is_available():
             providers.insert(0, 'CUDAExecutionProvider')
@@ -542,8 +565,317 @@ def verify_onnx_model(onnx_path, input_shapes=None):
         return True
         
     except Exception as e:
-        print(f"✗ ONNX model verification failed: {e}")
+        error_msg = str(e)
+        if "2GiB limit" in error_msg or "too large" in error_msg:
+            print(f"Model has external data (>2GB), trying runtime verification only...")
+            try:
+                # Try to create session without full model checking
+                providers = ['CPUExecutionProvider']
+                session = ort.InferenceSession(onnx_path, providers=providers)
+                print(f"✓ ONNX model {onnx_path} is valid (runtime verification)")
+                print(f"  Input names: {[inp.name for inp in session.get_inputs()]}")
+                print(f"  Output names: {[out.name for out in session.get_outputs()]}")
+                return True
+            except Exception as e2:
+                print(f"✗ Runtime verification also failed: {e2}")
+                return False
+        else:
+            print(f"✗ ONNX model verification failed: {e}")
+            return False
+
+def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type="general"):
+    """Convert FP32 ONNX model to INT8 using static quantization with QDQ format (Mac-compatible)"""
+    if not INT8_AVAILABLE:
+        print(f"Skipping INT8 conversion for {fp32_model_path} - onnxruntime quantization not available")
         return False
+        
+    try:
+        print(f"Converting {fp32_model_path} to INT8 using static QDQ quantization (Mac-compatible)...")
+        
+        # Import static quantization functions
+        from onnxruntime.quantization import quantize_static, CalibrationMethod, QuantFormat
+        from onnxruntime.quantization.calibrate import CalibrationDataReader
+        
+        # Create a simple calibration data reader
+        class DummyCalibrationDataReader(CalibrationDataReader):
+            def __init__(self, model_path):
+                self.model_path = model_path
+                self.data_generated = False
+                
+                # Load model to get input shapes and types
+                import onnx
+                model = onnx.load(model_path)
+                self.input_names = [inp.name for inp in model.graph.input]
+                self.input_shapes = {}
+                self.input_types = {}
+                
+                for inp in model.graph.input:
+                    # Get shape
+                    shape = []
+                    for dim in inp.type.tensor_type.shape.dim:
+                        if dim.dim_value > 0:
+                            shape.append(dim.dim_value)
+                        else:
+                            # Use realistic defaults for dynamic dimensions based on input name
+                            if inp.name == 'image':
+                                # VAE Encoder image input: use typical 256x256 RGB
+                                if len(shape) == 0:  # batch dimension
+                                    shape.append(1)
+                                elif len(shape) == 1:  # channels
+                                    shape.append(3)
+                                elif len(shape) == 2:  # height
+                                    shape.append(256)
+                                elif len(shape) == 3:  # width
+                                    shape.append(256)
+                                else:
+                                    shape.append(1)
+                            elif inp.name == 'latents':
+                                # VAE Decoder latent input: use typical 32x32
+                                if len(shape) == 0:  # batch dimension
+                                    shape.append(1)
+                                elif len(shape) == 1:  # channels
+                                    shape.append(4)
+                                elif len(shape) == 2:  # height
+                                    shape.append(32)
+                                elif len(shape) == 3:  # width
+                                    shape.append(32)
+                                else:
+                                    shape.append(1)
+                            elif 'latent' in inp.name.lower():
+                                # UNet latent input: use 32x32
+                                if len(shape) >= 2:
+                                    shape.append(32)
+                                else:
+                                    shape.append(1)
+                            elif 'audio' in inp.name.lower():
+                                # Audio input: use realistic audio dimensions
+                                if len(shape) == 1:  # sequence length
+                                    shape.append(50)
+                                elif len(shape) == 2:  # features
+                                    shape.append(384)
+                                else:
+                                    shape.append(1)
+                            else:
+                                shape.append(1)  # Default fallback
+                    self.input_shapes[inp.name] = shape
+                    
+                    # Get data type
+                    elem_type = inp.type.tensor_type.elem_type
+                    if elem_type == onnx.TensorProto.FLOAT:
+                        self.input_types[inp.name] = np.float32
+                    elif elem_type == onnx.TensorProto.INT64:
+                        self.input_types[inp.name] = np.int64
+                    elif elem_type == onnx.TensorProto.INT32:
+                        self.input_types[inp.name] = np.int32
+                    else:
+                        # Default to float32 for unknown types
+                        self.input_types[inp.name] = np.float32
+                        print(f"Warning: Unknown data type {elem_type} for input {inp.name}, using float32")
+                
+            def get_next(self):
+                if not self.data_generated:
+                    self.data_generated = True
+                    # Generate dummy calibration data with proper types
+                    calibration_data = {}
+                    for name, shape in self.input_shapes.items():
+                        dtype = self.input_types[name]
+                        if dtype == np.int64 or dtype == np.int32:
+                            # For integer types, generate small positive values
+                            calibration_data[name] = np.zeros(shape, dtype=dtype)
+                        else:
+                            # For float types, generate random data
+                            calibration_data[name] = np.random.randn(*shape).astype(dtype)
+                    
+                    print(f"Generated calibration data with types: {[(name, self.input_types[name]) for name in self.input_names]}")
+                    return calibration_data
+                else:
+                    return None
+        
+        # Create calibration data reader
+        calibration_reader = DummyCalibrationDataReader(fp32_model_path)
+        
+        # Use static quantization with QDQ format (avoids ConvInteger)
+        quantize_static(
+            model_input=fp32_model_path,
+            model_output=int8_model_path,
+            calibration_data_reader=calibration_reader,
+            quant_format=QuantFormat.QDQ,  # Use QDQ format instead of QOperator
+            weight_type=QuantType.QInt8,
+            activation_type=QuantType.QInt8,
+            use_external_data_format=True,
+            calibrate_method=CalibrationMethod.MinMax
+        )
+        
+        print(f"✓ INT8 QDQ model saved to {int8_model_path}")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Failed to convert {fp32_model_path} to INT8 QDQ: {e}")
+        return False
+
+def convert_model_to_int8_alternative(fp32_model_path, int8_model_path, model_type="general"):
+    """Convert FP32 ONNX model to INT8 using QDQ format (avoids ConvInteger operations)"""
+    if not INT8_AVAILABLE:
+        print(f"Skipping INT8 conversion for {fp32_model_path} - onnxruntime quantization not available")
+        return False
+        
+    try:
+        # First try static QDQ quantization (most Mac-compatible)
+        if convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type):
+            return True
+        
+        print(f"Static QDQ quantization failed, trying minimal dynamic quantization...")
+        
+        # Fallback to minimal dynamic quantization
+        quantize_dynamic(
+            model_input=fp32_model_path,
+            model_output=int8_model_path,
+            weight_type=QuantType.QInt8,
+            use_external_data_format=True  # Handle large models
+        )
+        
+        print(f"✓ INT8 model (minimal dynamic) saved to {int8_model_path}")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Failed to convert {fp32_model_path} to INT8 (all methods): {e}")
+        return False
+
+def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general"):
+    """Convert FP32 ONNX model to INT8 using best approach for Mac compatibility"""
+    if not INT8_AVAILABLE:
+        print(f"Skipping INT8 conversion for {fp32_model_path} - onnxruntime quantization not available")
+        return False
+        
+    try:
+        print(f"Converting {fp32_model_path} to INT8 (Mac-compatible approach)...")
+        
+        # Choose quantization type based on model
+        if model_type in ["unet", "vae_encoder", "vae_decoder"]:
+            print(f"Using QInt8 quantization for {model_type}")
+        else:
+            print(f"Using conservative quantization for {model_type}")
+        
+        # Try approaches in order of Mac compatibility:
+        # 1. Static QDQ quantization (most compatible)
+        # 2. Alternative dynamic quantization
+        success = convert_model_to_int8_alternative(fp32_model_path, int8_model_path, model_type)
+        
+        if success:
+            print(f"✓ INT8 model saved to {int8_model_path}")
+            return True
+        else:
+            print(f"✗ All quantization methods failed for {fp32_model_path}")
+            return False
+            
+    except Exception as e:
+        print(f"✗ Failed to convert {fp32_model_path} to INT8: {e}")
+        return False
+
+def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
+    """Copy exported models to Unity StreamingAssets folder"""
+    # Define StreamingAssets path
+    unity_streaming_assets = Path("../MysteryAI/Assets/StreamingAssets/MuseTalk")
+    
+    if not unity_streaming_assets.exists():
+        print(f"Creating StreamingAssets directory: {unity_streaming_assets}")
+        unity_streaming_assets.mkdir(parents=True, exist_ok=True)
+    
+    source_path = Path(source_dir)
+    copied_files = []
+    
+    # Models to copy (FP32 and INT8 versions)
+    models_to_copy = [
+        f"unet{model_suffix}.onnx",
+        f"unet{model_suffix}_int8.onnx",
+        f"vae_encoder{model_suffix}.onnx", 
+        f"vae_encoder{model_suffix}_int8.onnx",
+        f"vae_decoder{model_suffix}.onnx",
+        f"vae_decoder{model_suffix}_int8.onnx",
+        f"positional_encoding{model_suffix}.onnx",
+        f"positional_encoding{model_suffix}_int8.onnx",
+        "whisper_encoder.onnx",
+        "whisper_encoder_int8.onnx",
+        "face_parsing.onnx",
+        "face_parsing_int8.onnx",
+        f"onnx_config{model_suffix}.json"
+    ]
+    
+    # Copy external data files for large models (UNet)
+    external_data_files = [
+        f"unet{model_suffix}.onnx.data",
+        f"unet{model_suffix}_int8.onnx.data"
+    ]
+    
+    for model_file in models_to_copy:
+        source_file = source_path / model_file
+        dest_file = unity_streaming_assets / model_file
+        
+        if source_file.exists():
+            try:
+                shutil.copy2(source_file, dest_file)
+                copied_files.append(model_file)
+                print(f"✓ Copied {model_file} to StreamingAssets")
+            except Exception as e:
+                print(f"✗ Failed to copy {model_file}: {e}")
+        else:
+            print(f"⚠️ Model file not found: {source_file}")
+    
+    # Copy external data files for large models
+    for data_file in external_data_files:
+        source_file = source_path / data_file
+        dest_file = unity_streaming_assets / data_file
+        
+        if source_file.exists():
+            try:
+                shutil.copy2(source_file, dest_file)
+                copied_files.append(data_file)
+                print(f"✓ Copied external data {data_file} to StreamingAssets")
+            except Exception as e:
+                print(f"✗ Failed to copy external data {data_file}: {e}")
+    
+    print(f"\n✓ Successfully copied {len(copied_files)} files to StreamingAssets")
+    return copied_files
+
+def export_model_with_quantization(export_func, model, output_path, model_name, export_int8=True, device="cpu", opset_version=18, **kwargs):
+    """Export model in FP32 and INT8 formats"""
+    # Convert path to string and create variant paths
+    fp32_path = str(output_path)
+    int8_path = fp32_path.replace('.onnx', '_int8.onnx')
+    
+    success_count = 0
+    
+    # Extract model type for INT8 quantization
+    model_type = model_name.lower().replace(" ", "_")
+    
+    # Export FP32 model
+    try:
+        print(f"\n=== Exporting {model_name} (FP32) ===")
+        if export_func(model, fp32_path, device, opset_version, **kwargs):
+            if verify_onnx_model(fp32_path):
+                success_count += 1
+                print(f"✓ {model_name} FP32 export successful")
+                
+                # Convert to INT8 if requested (CPU-optimized)
+                if export_int8:
+                    if convert_model_to_int8(fp32_path, int8_path, model_type):
+                        if verify_onnx_model(int8_path):
+                            success_count += 1
+                            print(f"✓ {model_name} INT8 quantization successful")
+                        else:
+                            print(f"✗ {model_name} INT8 model verification failed")
+                    else:
+                        print(f"✗ {model_name} INT8 quantization failed")
+                else:
+                    print(f"⚠️ Skipping INT8 quantization for {model_name}")
+            else:
+                print(f"✗ {model_name} FP32 model verification failed")
+        else:
+            print(f"✗ {model_name} FP32 export failed")
+    except Exception as e:
+        print(f"✗ Failed to export {model_name}: {e}")
+    
+    return success_count
 
 def main():
     parser = argparse.ArgumentParser(description="Export MuseTalk models to ONNX")
@@ -558,8 +890,30 @@ def main():
                        default=["all"], help="Models to export")
     parser.add_argument("--opset_version", type=int, default=18,
                        help="ONNX opset version to use (11-18)")
+    parser.add_argument("--int8", action="store_true", default=True,
+                       help="Export INT8 quantized models (CPU-optimized, default: True)")
+    parser.add_argument("--no-int8", action="store_true", 
+                       help="Disable INT8 quantization")
+    parser.add_argument("--copy-to-unity", action="store_true", default=True,
+                       help="Copy exported models to Unity StreamingAssets (default: True)")
+    parser.add_argument("--no-copy-unity", action="store_true", 
+                       help="Disable copying to Unity StreamingAssets")
     
     args = parser.parse_args()
+    
+    # Handle quantization and Unity copy flags
+    export_int8 = args.int8 and not args.no_int8 and INT8_AVAILABLE
+    copy_to_unity = args.copy_to_unity and not args.no_copy_unity
+    
+    if args.int8 and not INT8_AVAILABLE:
+        print("⚠️ INT8 quantization requested but onnxruntime quantization not available")
+        export_int8 = False
+    
+    # Recommend INT8 for CPU-only setups
+    if export_int8:
+        print("🍎 Using INT8 quantization - optimal for CPU inference (especially on Mac)")
+    else:
+        print("📝 Exporting FP32 models only")
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -621,54 +975,42 @@ def main():
         if "unet" in models_to_export:
             unet_path = output_dir / f"unet{model_suffix}.onnx"
             try:
-                if export_unet_to_onnx(unet, unet_path, args.opset_version, device):
-                    if verify_onnx_model(unet_path):
-                        success_count += 1
+                success_count += export_model_with_quantization(export_unet_to_onnx, unet, unet_path, "UNet", export_int8, device, args.opset_version)
             except Exception as e:
                 print(f"Failed to export UNet: {e}")
         
         if "vae_encoder" in models_to_export:
             vae_encoder_path = output_dir / f"vae_encoder{model_suffix}.onnx"
             try:
-                if export_vae_encoder_to_onnx(vae, vae_encoder_path, device, args.opset_version):
-                    if verify_onnx_model(vae_encoder_path):
-                        success_count += 1
+                success_count += export_model_with_quantization(export_vae_encoder_to_onnx, vae, vae_encoder_path, "VAE Encoder", export_int8, device, args.opset_version)
             except Exception as e:
                 print(f"Failed to export VAE Encoder: {e}")
         
         if "vae_decoder" in models_to_export:
             vae_decoder_path = output_dir / f"vae_decoder{model_suffix}.onnx"
             try:
-                if export_vae_decoder_to_onnx(vae, vae_decoder_path, device, args.opset_version):
-                    if verify_onnx_model(vae_decoder_path):
-                        success_count += 1
+                success_count += export_model_with_quantization(export_vae_decoder_to_onnx, vae, vae_decoder_path, "VAE Decoder", export_int8, device, args.opset_version)
             except Exception as e:
                 print(f"Failed to export VAE Decoder: {e}")
         
         if "pe" in models_to_export:
             pe_path = output_dir / f"positional_encoding{model_suffix}.onnx"
             try:
-                if export_positional_encoding_to_onnx(pe, pe_path, device, args.opset_version):
-                    if verify_onnx_model(pe_path):
-                        success_count += 1
+                success_count += export_model_with_quantization(export_positional_encoding_to_onnx, pe, pe_path, "Positional Encoding", export_int8, device, args.opset_version)
             except Exception as e:
                 print(f"Failed to export Positional Encoding: {e}")
         
         if "whisper" in models_to_export and 'whisper' in locals():
             whisper_path = output_dir / "whisper_encoder.onnx"
             try:
-                if export_whisper_to_onnx(whisper, whisper_path, device, args.opset_version):
-                    if verify_onnx_model(whisper_path):
-                        success_count += 1
+                success_count += export_model_with_quantization(export_whisper_to_onnx, whisper, whisper_path, "Whisper", export_int8, device, args.opset_version)
             except Exception as e:
                 print(f"Failed to export Whisper: {e}")
         
         if "face_parsing" in models_to_export and 'fp' in locals():
             face_parsing_path = output_dir / "face_parsing.onnx"
             try:
-                if export_face_parsing_to_onnx(fp, face_parsing_path, device, args.opset_version):
-                    if verify_onnx_model(face_parsing_path):
-                        success_count += 1
+                success_count += export_model_with_quantization(export_face_parsing_to_onnx, fp, face_parsing_path, "Face Parsing", export_int8, device, args.opset_version)
             except Exception as e:
                 print(f"Failed to export Face Parsing: {e}")
         
@@ -681,7 +1023,11 @@ def main():
             "model_suffix": model_suffix,
             "exported_models": models_to_export,
             "device": str(device),
-            "opset_version": args.opset_version
+            "opset_version": args.opset_version,
+            "int8_exported": export_int8,
+            "int8_available": INT8_AVAILABLE,
+            "copied_to_unity": copy_to_unity,
+            "success_count": success_count
         }
         
         config_path = output_dir / f"onnx_config{model_suffix}.json"
@@ -689,6 +1035,10 @@ def main():
             json.dump(config, f, indent=2)
         
         print(f"Configuration saved to: {config_path}")
+        
+        # Copy models to StreamingAssets
+        if copy_to_unity:
+            copied_files = copy_to_streaming_assets(output_dir, model_suffix)
         
     except Exception as e:
         print(f"Error during export: {e}")
