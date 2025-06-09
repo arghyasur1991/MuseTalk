@@ -694,6 +694,16 @@ def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_typ
         # Create calibration data reader
         calibration_reader = DummyCalibrationDataReader(fp32_model_path)
         
+        # Determine if we need external data format (only for large models > 2GB)
+        import os
+        model_size = os.path.getsize(fp32_model_path)
+        use_external_data = model_size > 1024 * 1024 * 100  # > 100MB threshold
+        
+        if use_external_data:
+            print(f"Large model detected ({model_size / 1024 / 1024:.1f}MB), using external data format")
+        else:
+            print(f"Small model ({model_size / 1024 / 1024:.1f}MB), using embedded format")
+        
         # Use static quantization with QDQ format (avoids ConvInteger)
         quantize_static(
             model_input=fp32_model_path,
@@ -702,7 +712,7 @@ def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_typ
             quant_format=QuantFormat.QDQ,  # Use QDQ format instead of QOperator
             weight_type=QuantType.QInt8,
             activation_type=QuantType.QInt8,
-            use_external_data_format=True,
+            use_external_data_format=use_external_data,  # Only for large models
             calibrate_method=CalibrationMethod.MinMax
         )
         
@@ -727,11 +737,14 @@ def convert_model_to_int8_alternative(fp32_model_path, int8_model_path, model_ty
         print(f"Static QDQ quantization failed, trying minimal dynamic quantization...")
         
         # Fallback to minimal dynamic quantization
+        model_size = os.path.getsize(fp32_model_path)
+        use_external_data = model_size > 1024 * 1024 * 100  # > 100MB threshold
+        
         quantize_dynamic(
             model_input=fp32_model_path,
             model_output=int8_model_path,
             weight_type=QuantType.QInt8,
-            use_external_data_format=True  # Handle large models
+            use_external_data_format=use_external_data  # Only for large models
         )
         
         print(f"✓ INT8 model (minimal dynamic) saved to {int8_model_path}")
@@ -784,14 +797,12 @@ def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
     source_path = Path(source_dir)
     copied_files = []
     
-    # Models to copy (FP32 and INT8 versions)
+    # Models to copy (FP32 and INT8 versions, except VAE models stay FP32 for quality)
     models_to_copy = [
         f"unet{model_suffix}.onnx",
         f"unet{model_suffix}_int8.onnx",
-        f"vae_encoder{model_suffix}.onnx", 
-        f"vae_encoder{model_suffix}_int8.onnx",
-        f"vae_decoder{model_suffix}.onnx",
-        f"vae_decoder{model_suffix}_int8.onnx",
+        f"vae_encoder{model_suffix}.onnx",  # FP32 only for quality
+        f"vae_decoder{model_suffix}.onnx",  # FP32 only for quality
         f"positional_encoding{model_suffix}.onnx",
         f"positional_encoding{model_suffix}_int8.onnx",
         "whisper_encoder.onnx",
@@ -847,6 +858,11 @@ def export_model_with_quantization(export_func, model, output_path, model_name, 
     
     # Extract model type for INT8 quantization
     model_type = model_name.lower().replace(" ", "_")
+    
+    # Skip INT8 for VAE models to preserve image quality
+    if model_type in ["vae_encoder", "vae_decoder"]:
+        print(f"⚠️ Skipping INT8 quantization for {model_name} to preserve image quality")
+        export_int8 = False
     
     # Export FP32 model
     try:

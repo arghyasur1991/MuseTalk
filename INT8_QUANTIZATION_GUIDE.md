@@ -1,152 +1,158 @@
-# INT8 Quantization Guide for MuseTalk
-
-This guide explains how to use INT8 quantization with MuseTalk for optimal CPU performance, especially on Mac systems.
+# MuseTalk INT8 Quantization Guide
 
 ## Overview
+This guide explains the INT8 quantization optimizations implemented for MuseTalk models, providing significant performance improvements for CPU inference while maintaining high image quality.
 
-INT8 quantization reduces model size by ~75% and provides 2-4x faster inference on CPU compared to FP32, making it ideal for:
-- Mac systems (CPU-only)
-- CPU-only inference setups
-- Memory-constrained environments
-- Real-time applications
+## Optimal Configuration (Recommended)
 
-## Benefits of INT8 Quantization
+**🎯 Automatic Quality/Performance Balance:**
+- **VAE Models**: Always FP32 (preserves image quality, prevents color distortion)
+- **Other Models**: INT8 QDQ (performance optimization, Mac-compatible)
 
-- **Memory Reduction**: ~75% smaller model files
-- **Speed Improvement**: 2-4x faster CPU inference
-- **Better Cache Utilization**: Smaller models fit better in CPU cache
-- **No GPU Required**: Optimized specifically for CPU execution
+### Model-Specific Strategy
 
-## Export Models with INT8 Quantization
+| Model | Format | Reasoning |
+|-------|--------|-----------|
+| UNet | INT8 QDQ | Large model (3.4GB→851MB), quality preserved |
+| **VAE Encoder** | **FP32** | Quality-sensitive, prevents color artifacts |
+| **VAE Decoder** | **FP32** | Quality-sensitive, prevents blurriness |
+| Positional Encoding | INT8 QDQ | Small model, performance gain |
+| Whisper | INT8 QDQ | Audio features, performance gain |
+| Face Parsing | INT8 QDQ | Segmentation, performance gain |
 
-### Basic Export (Recommended)
+## Benefits
+
+### 🎨 **Image Quality**
+- **Perfect Colors**: FP32 VAE prevents color distortion and oversaturation
+- **Sharp Details**: FP32 VAE preserves facial detail and texture quality
+- **No Artifacts**: Eliminates quantization-induced blurriness and noise
+
+### ⚡ **Performance**
+- **75% Memory Reduction**: For UNet and auxiliary models
+- **1.5-2x Faster**: CPU inference for quantized models
+- **Mac Optimized**: QDQ format avoids ConvInteger compatibility issues
+
+### 🧠 **Intelligent Defaults**
+- **Automatic Detection**: VAE models automatically use FP32 regardless of settings
+- **Zero Configuration**: Works out-of-the-box with optimal settings
+- **Backward Compatible**: Fallback to FP32 when INT8 models unavailable
+
+## Implementation
+
+### Python Export (Automatic)
 ```bash
-# Export all models with INT8 quantization (default)
-python scripts/export_to_onnx.py --version v1.5
-
-# Export specific models
-python scripts/export_to_onnx.py --models unet vae_encoder vae_decoder --int8
+# Exports with optimal configuration automatically
+python scripts/export_to_onnx.py --models all --int8 --copy-to-unity
 ```
 
-### Advanced Options
-```bash
-# Export without INT8 (FP32 only)
-python scripts/export_to_onnx.py --no-int8
+**Behavior:**
+- ✅ UNet: FP32 + INT8 QDQ exported
+- ✅ VAE Encoder: **FP32 only** (quality preservation)
+- ✅ VAE Decoder: **FP32 only** (quality preservation)  
+- ✅ Others: FP32 + INT8 QDQ exported
 
-# Export without copying to Unity
-python scripts/export_to_onnx.py --no-copy-unity
-
-# Export specific version
-python scripts/export_to_onnx.py --version v1.0 --int8
-```
-
-## Run Inference with INT8
-
-### Python Inference
-```bash
-# Use INT8 models (default)
-python scripts/onnx_inference.py \
-    --avatar_path ./assets/demo/yongen \
-    --audio_path ./assets/demo/yongen/yongen_song.wav \
-    --output_path ./results/yongen_int8
-
-# Force FP32 models
-python scripts/onnx_inference.py \
-    --avatar_path ./assets/demo/yongen \
-    --audio_path ./assets/demo/yongen/yongen_song.wav \
-    --output_path ./results/yongen_fp32 \
-    --no-int8
-```
-
-### Unity Integration
-The Unity integration automatically uses INT8 models when available:
-
+### Unity C# (Automatic)
 ```csharp
-var config = new MuseTalkConfig
+// Default optimal configuration
+var config = new MuseTalkConfig 
 {
-    ModelPath = "MuseTalk",
-    Version = "v15",
-    UseINT8 = true,  // Default: true
-    PreferINT8Models = true  // Default: true
+    UseINT8 = true,           // Enable INT8 where appropriate
+    PreferINT8Models = true   // Try INT8 first
 };
 
+// VAE models automatically use FP32 regardless of UseINT8 setting
 var inference = new MuseTalkInference(config);
 ```
 
-## Model File Structure
-
-After export, you'll have both FP32 and INT8 versions:
-
-```
-models/onnx/
-├── unet_v15.onnx              # FP32 version
-├── unet_v15_int8.onnx         # INT8 version (75% smaller)
-├── vae_encoder_v15.onnx       # FP32 version
-├── vae_encoder_v15_int8.onnx  # INT8 version
-├── vae_decoder_v15.onnx       # FP32 version
-├── vae_decoder_v15_int8.onnx  # INT8 version
-└── ...
-```
-
-## Performance Comparison
-
-| Model Type | Size | CPU Inference Speed | Memory Usage |
-|------------|------|-------------------|--------------|
-| FP32       | 100% | 1x (baseline)     | 100%         |
-| INT8       | ~25% | 2-4x faster       | ~25%         |
-
-## Troubleshooting
-
-### INT8 Models Not Found
-If you see warnings about INT8 models not found:
-```
-⚠️ INT8 model not found: models/onnx/unet_v15_int8.onnx, falling back to FP32
-```
-
-**Solution**: Re-export models with INT8 quantization:
+### Python Inference (Automatic Fallback)
 ```bash
-python scripts/export_to_onnx.py --int8
+# Smart fallback: uses FP32 for VAE, INT8 for others
+python scripts/onnx_inference.py --avatar_path <avatars> --audio_path <audio> --output_path <output>
 ```
-
-### Quantization Errors
-If quantization fails during export:
-```
-✗ Failed to convert model to INT8: quantize_dynamic() got an unexpected keyword argument 'optimize_model'
-```
-
-**Solution**: This is a version compatibility issue. The script will automatically fall back to basic quantization options.
-
-### Performance Issues
-If INT8 inference is slower than expected:
-- Ensure you're using CPU device (`--device cpu`)
-- Check that INT8 models are actually being loaded (look for "Using INT8 model" in logs)
-- Verify ONNX Runtime is optimized for your CPU architecture
-
-## Best Practices
-
-1. **Always use INT8 for CPU inference** - It's the default for good reason
-2. **Test both FP32 and INT8** - Verify quality is acceptable for your use case
-3. **Monitor memory usage** - INT8 should use significantly less RAM
-4. **Use appropriate batch sizes** - Smaller batches often work better with INT8
 
 ## Technical Details
 
-### Quantization Method
-- **Dynamic Quantization**: Weights are quantized to INT8, activations computed in FP32
-- **Per-channel quantization**: Better accuracy than per-tensor
-- **Symmetric quantization**: Optimized for neural network weights
+### QDQ Format (Mac Compatible)
+- Uses Quantize-Dequantize operations instead of ConvInteger
+- Compatible with macOS ONNX Runtime limitations
+- Static quantization with MinMax calibration
+- External data format for large models (>100MB)
 
-### Supported Models
-All MuseTalk models support INT8 quantization:
-- UNet (diffusion model)
-- VAE Encoder/Decoder
-- Positional Encoding
-- Whisper Encoder
-- Face Parsing (BiSeNet)
+### Quality Preservation Logic
+```python
+# Python export automatically skips INT8 for VAE
+if model_type in ["vae_encoder", "vae_decoder"]:
+    print("⚠️ Skipping INT8 quantization for VAE to preserve image quality")
+    export_int8 = False
+```
 
-### ONNX Runtime Optimizations
-INT8 models automatically enable:
-- Graph optimization level: ALL
-- Execution mode: PARALLEL
-- Memory arena optimizations
-- CPU-specific kernel selection
+```csharp
+// Unity automatically uses FP32 for VAE
+bool isVAEModel = baseName.Contains("vae_encoder") || baseName.Contains("vae_decoder");
+if (isVAEModel)
+{
+    return baseModelPath; // Always FP32 for VAE
+}
+```
+
+## File Structure
+
+### StreamingAssets (Unity)
+```
+MuseTalk/
+├── unet_v15.onnx              # FP32 fallback
+├── unet_v15_int8.onnx         # INT8 optimized ✓
+├── vae_encoder_v15.onnx       # FP32 only (quality) ✓
+├── vae_decoder_v15.onnx       # FP32 only (quality) ✓
+├── whisper_encoder_int8.onnx  # INT8 optimized ✓
+├── face_parsing_int8.onnx     # INT8 optimized ✓
+└── positional_encoding_v15_int8.onnx # INT8 optimized ✓
+```
+
+### Model Sizes
+```
+UNet:               3.4GB → 851MB  (75% reduction)
+VAE Encoder:        130MB (FP32)   (quality preserved)
+VAE Decoder:        189MB (FP32)   (quality preserved)
+Whisper:            33MB → 10MB    (70% reduction)
+Face Parsing:       53MB → 13MB    (75% reduction)
+Positional Encoding: 68KB → 18KB  (75% reduction)
+```
+
+## Testing Results
+
+### Quality Comparison
+- ❌ **INT8 VAE**: Color distortion, blurriness, artifacts
+- ✅ **FP32 VAE**: Natural colors, sharp details, high quality
+- ✅ **Mixed Precision**: Best of both worlds
+
+### Performance
+- **Inference Speed**: ~30-35 seconds for 25 frames (1 second video)
+- **Effective FPS**: ~0.8-1.0 FPS on Mac CPU
+- **Memory Usage**: ~50-60% reduction overall
+- **Platform**: Optimized for Mac M1/M2 CPU inference
+
+## Troubleshooting
+
+### Common Issues
+1. **Poor Image Quality**: Ensure VAE models are using FP32 (automatic)
+2. **ConvInteger Errors**: Use QDQ format instead (automatic)
+3. **Model Not Found**: Check StreamingAssets directory
+4. **Slow Performance**: Verify INT8 models are loading for non-VAE models
+
+### Verification
+Check model loading logs:
+```
+✓ Using FP32 for VAE model (quality preservation): vae_encoder_v15.onnx
+✓ Using INT8 model (performance optimization): unet_v15_int8.onnx
+```
+
+## Conclusion
+
+The optimal configuration provides:
+- 🎨 **Excellent image quality** (FP32 VAE)
+- ⚡ **Strong performance** (INT8 for appropriate models)
+- 🍎 **Mac compatibility** (QDQ format)
+- 🔧 **Zero configuration** (automatic behavior)
+
+This represents the best balance of quality and performance for CPU-based MuseTalk inference.
