@@ -24,7 +24,7 @@ fi
 
 # Set config path based on mode
 if [ "$mode" = "normal" ]; then
-    config_path="./configs/inference/test.yaml"
+    config_path="./configs/inference/test2.yaml"
     result_dir="./results/test"
 else
     config_path="./configs/inference/realtime.yaml"
