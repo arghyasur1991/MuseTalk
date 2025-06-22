@@ -230,18 +230,6 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     # Set model to evaluation mode
     vae_model.vae.eval()
     
-    # Disable flash attention for ONNX export
-    try:
-        # Disable attention optimizations
-        vae_model.vae.set_attention_slice(None)
-        if hasattr(vae_model.vae, 'set_use_memory_efficient_attention_xformers'):
-            vae_model.vae.set_use_memory_efficient_attention_xformers(False)
-        if hasattr(vae_model.vae, 'set_attn_processor'):
-            from diffusers.models.attention_processor import AttnProcessor
-            vae_model.vae.set_attn_processor(AttnProcessor())
-    except Exception as e:
-        print(f"Warning: Could not disable VAE attention optimizations: {e}")
-    
     # Create dummy input with dynamic dimensions
     batch_size = 1
     channels = 3
