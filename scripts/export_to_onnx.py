@@ -297,21 +297,21 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     vae_model.vae.eval()
     
     # Disable flash attention for ONNX export
-    try:
-        # Disable attention optimizations
-        vae_model.vae.set_attention_slice(None)
-        if hasattr(vae_model.vae, 'set_use_memory_efficient_attention_xformers'):
-            vae_model.vae.set_use_memory_efficient_attention_xformers(False)
-        if hasattr(vae_model.vae, 'set_attn_processor'):
-            from diffusers.models.attention_processor import AttnProcessor
-            vae_model.vae.set_attn_processor(AttnProcessor())
-    except Exception as e:
-        print(f"Warning: Could not disable VAE attention optimizations: {e}")
+    # try:
+    #     # Disable attention optimizations
+    #     vae_model.vae.set_attention_slice(None)
+    #     if hasattr(vae_model.vae, 'set_use_memory_efficient_attention_xformers'):
+    #         vae_model.vae.set_use_memory_efficient_attention_xformers(False)
+    #     if hasattr(vae_model.vae, 'set_attn_processor'):
+    #         from diffusers.models.attention_processor import AttnProcessor
+    #         vae_model.vae.set_attn_processor(AttnProcessor())
+    # except Exception as e:
+    #     print(f"Warning: Could not disable VAE attention optimizations: {e}")
     
     # Create dummy input with dynamic dimensions
     batch_size = 1
     latent_channels = 4
-    latent_height, latent_width = 64, 64  # Use larger base size for better compatibility
+    latent_height, latent_width = 32, 32  # Use larger base size for better compatibility
     
     dummy_latents = torch.randn(batch_size, latent_channels, latent_height, latent_width).to(device)
     
@@ -337,10 +337,10 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
         do_constant_folding=True,
         input_names=['latents'],
         output_names=['image'],
-        dynamic_axes={
-            'latents': {0: 'batch_size', 2: 'latent_height', 3: 'latent_width'},
-            'image': {0: 'batch_size', 2: 'height', 3: 'width'}
-        },
+        # dynamic_axes={
+        #     'latents': {0: 'batch_size', 2: 'latent_height', 3: 'latent_width'},
+        #     'image': {0: 'batch_size', 2: 'height', 3: 'width'}
+        # },
         verbose=False,
         training=torch.onnx.TrainingMode.EVAL
     )
