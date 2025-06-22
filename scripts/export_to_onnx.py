@@ -68,6 +68,55 @@ from musetalk.models.unet import PositionalEncoding
 from transformers import WhisperModel
 from musetalk.utils.face_parsing import FaceParsing
 
+from onnxruntime.transformers.float16 import convert_float_to_float16
+from onnxruntime.transformers.fusion_options import FusionOptions
+from onnxruntime.transformers.optimizer import optimize_model
+
+@torch.no_grad()
+def tune_model(
+    model_path: str,
+    model_type: str,
+    fp16: bool
+):
+    model_dir=os.path.dirname(model_path)
+    
+    # First we set our optimisation to the ORT Optimizer defaults for the provided type
+    optimization_options = FusionOptions(model_type)
+    # The ORT optimizer is designed for ORT GPU and CUDA
+    # To make things work with ORT DirectML, we disable some options
+    # The GroupNorm op has a very negative effect on VRAM and CPU use
+    optimization_options.enable_group_norm = False
+    # On by default in ORT optimizer, turned off as it causes performance issues
+    optimization_options.enable_nhwc_conv = False
+    # On by default in ORT optimizer, turned off because it has no effect
+    optimization_options.enable_qordered_matmul = False
+    optimization_options.enable_bias_splitgelu = False
+    optimizer = optimize_model(
+        input = model_path,
+        model_type = model_type,
+        opt_level = 0,
+        optimization_options = optimization_options,
+        use_gpu = False,
+        only_onnxruntime = False
+    )
+    if fp16:
+        optimizer.convert_float_to_float16(
+        keep_io_types=True, disable_shape_infer=True, op_block_list=['RandomNormalLike']
+    )
+    optimizer.topological_sort()
+        
+    # shutil.rmtree(model_dir)
+    # os.mkdir(model_dir)
+    # collate external tensor files into one
+    onnx.save_model(
+        optimizer.model,
+        model_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=f"{os.path.basename(model_path)}.data",
+        convert_attribute=False,
+    )
+
 def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18, use_timesteps=False, fixed_timestep=0):
     """Export UNet model to ONNX format with external data support
     
@@ -193,6 +242,8 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18, use_t
         # Clean up temp file
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+        tune_model(output_path, "unet", fp16=False)
             
         print(f"UNet exported successfully with external data")
         
