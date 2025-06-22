@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import shutil
 from onnxsim import simplify
+from onnx import numpy_helper
 
 # INT8 quantization support
 try:
@@ -254,6 +255,63 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18, use_t
     print(f"UNet exported successfully to {output_path}")
     return wrapper
 
+def is_one_element_tensor(tensor):
+    arr = numpy_helper.to_array(tensor)
+    return arr.shape == (1,)
+
+def make_scalar_initializer(tensor, name):
+    arr = numpy_helper.to_array(tensor)
+    scalar = np.asscalar(arr)
+    scalar_tensor = numpy_helper.from_array(np.array(scalar, dtype=arr.dtype), name=name)
+    return scalar_tensor
+
+def patch_pow_constants(model):
+    # Build dict of initializer tensors
+    init_dict = {init.name: init for init in model.graph.initializer}
+    
+    # Track new initializers
+    new_initializers = []
+
+    # Process Pow nodes
+    for node in model.graph.node:
+        if node.op_type == "Pow":
+            for i, input_name in enumerate(node.input):
+                # If the input is an initializer with shape [1]
+                if input_name in init_dict:
+                    tensor = init_dict[input_name]
+                    if is_one_element_tensor(tensor):
+                        scalar_tensor = make_scalar_initializer(tensor, tensor.name)
+                        new_initializers.append(scalar_tensor)
+                        init_dict[input_name] = scalar_tensor  # Replace in map
+
+    # Replace all initializers with updated ones
+    final_initializers = []
+    used_names = set()
+    for init in model.graph.initializer:
+        if init.name in init_dict and init.name not in used_names:
+            final_initializers.append(init_dict[init.name])
+            used_names.add(init.name)
+
+    model.graph.ClearField("initializer")
+    model.graph.initializer.extend(final_initializers)
+
+    # Also patch Constant nodes used in Pow
+    for node in model.graph.node:
+        if node.op_type == "Pow":
+            for i, input_name in enumerate(node.input):
+                # Find Constant node that outputs this
+                for const_node in model.graph.node:
+                    if const_node.op_type == "Constant" and const_node.output[0] == input_name:
+                        for attr in const_node.attribute:
+                            if attr.type == onnx.AttributeProto.TENSOR:
+                                arr = numpy_helper.to_array(attr.t)
+                                if arr.shape == (1,):
+                                    scalar = np.asscalar(arr)
+                                    scalar_tensor = numpy_helper.from_array(np.array(scalar, dtype=arr.dtype), name=attr.t.name)
+                                    attr.t.CopyFrom(scalar_tensor)
+
+    return model
+
 def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_version=18):
     """Export VAE encoder to ONNX"""
     print(f"Exporting VAE Encoder to {output_path} with opset {opset_version}")
@@ -301,12 +359,22 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     )
 
     tune_model(output_path, "vae", fp16=False)
+    fp16_path = output_path.replace('.onnx', '_fp16.onnx')
+    shutil.copy(output_path, fp16_path)
+    tune_model(fp16_path, "vae", fp16=True)
 
     model = onnx.load(output_path)
     model_simp, check = simplify(model)
     # copy original model to output path with .original suffix
     shutil.copy(output_path, output_path + ".original")
     onnx.save(model_simp, output_path)
+
+    model = onnx.load(fp16_path)
+    model = patch_pow_constants(model)
+    model_simp, check = simplify(model)
+    # copy original model to output path with .original suffix
+    shutil.copy(fp16_path, fp16_path + ".original")
+    onnx.save(model_simp, fp16_path)
     
     # Export to ONNX with dynamic axes for height and width
     # torch.onnx.export(
@@ -377,12 +445,22 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     )
 
     tune_model(output_path, "vae", fp16=False)
+    fp16_path = output_path.replace('.onnx', '_fp16.onnx')
+    shutil.copy(output_path, fp16_path)
+    tune_model(fp16_path, "vae", fp16=True)
 
     model = onnx.load(output_path)
     model_simp, check = simplify(model)
     # copy original model to output path with .original suffix
     shutil.copy(output_path, output_path + ".original")
     onnx.save(model_simp, output_path)
+
+    model = onnx.load(fp16_path)
+    model = patch_pow_constants(model)
+    model_simp, check = simplify(model)
+    # copy original model to output path with .original suffix
+    shutil.copy(fp16_path, fp16_path + ".original")
+    onnx.save(model_simp, fp16_path)
     
     print(f"VAE Decoder exported successfully to {output_path}")
     return True
