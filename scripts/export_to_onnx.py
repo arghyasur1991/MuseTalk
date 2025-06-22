@@ -233,7 +233,7 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     # Create dummy input with dynamic dimensions
     batch_size = 1
     channels = 3
-    height, width = 512, 512  # Use larger base size for better compatibility
+    height, width = 256, 256  # Use larger base size for better compatibility
     
     dummy_input = torch.randn(batch_size, channels, height, width).to(device)
     
@@ -250,8 +250,7 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
             return latent_dist.mode() * self.vae.config.scaling_factor
     
     encoder_wrapper = VAEEncoderWrapper(vae_model.vae).to(device)
-    
-    # Export to ONNX with dynamic axes for height and width
+
     torch.onnx.export(
         encoder_wrapper,
         dummy_input,
@@ -261,13 +260,28 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
         do_constant_folding=True,
         input_names=['image'],
         output_names=['latents'],
-        dynamic_axes={
-            'image': {0: 'batch_size', 2: 'height', 3: 'width'},
-            'latents': {0: 'batch_size', 2: 'latent_height', 3: 'latent_width'}
-        },
+        # No dynamic_axes --> static shape model
         verbose=False,
         training=torch.onnx.TrainingMode.EVAL
     )
+    
+    # Export to ONNX with dynamic axes for height and width
+    # torch.onnx.export(
+    #     encoder_wrapper,
+    #     dummy_input,
+    #     output_path,
+    #     export_params=True,
+    #     opset_version=opset_version,
+    #     do_constant_folding=True,
+    #     input_names=['image'],
+    #     output_names=['latents'],
+    #     dynamic_axes={
+    #         'image': {0: 'batch_size', 2: 'height', 3: 'width'},
+    #         'latents': {0: 'batch_size', 2: 'latent_height', 3: 'latent_width'}
+    #     },us
+    #     verbose=True,
+    #     training=torch.onnx.TrainingMode.EVAL
+    # )
     
     print(f"VAE Encoder exported successfully to {output_path}")
     return True
