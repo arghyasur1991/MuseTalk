@@ -792,7 +792,7 @@ def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general"
 def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
     """Copy exported models to Unity StreamingAssets folder"""
     # Define StreamingAssets path
-    unity_streaming_assets = Path("../MysteryAI/Assets/StreamingAssets/MuseTalk")
+    unity_streaming_assets = Path("../MysteryAI/Assets/StreamingAssets/LiveTalk")
     
     if not unity_streaming_assets.exists():
         print(f"Creating StreamingAssets directory: {unity_streaming_assets}")
