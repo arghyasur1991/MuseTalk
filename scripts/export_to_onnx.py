@@ -145,6 +145,7 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
             #     'noise_prediction': {0: 'batch_size'}
             # },
             verbose=False,
+            dynamo=True,
             training=torch.onnx.TrainingMode.EVAL
         )
 
