@@ -85,16 +85,16 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
             self.unet = unet_model.model
             
             # Disable attention optimizations for ONNX export
-            try:
-                # Disable flash attention and memory efficient attention
-                self.unet.set_attention_slice(None)
-                if hasattr(self.unet, 'set_use_memory_efficient_attention_xformers'):
-                    self.unet.set_use_memory_efficient_attention_xformers(False)
-                if hasattr(self.unet, 'set_attn_processor'):
-                    from diffusers.models.attention_processor import AttnProcessor
-                    self.unet.set_attn_processor(AttnProcessor())
-            except Exception as e:
-                print(f"Warning: Could not disable UNet attention optimizations: {e}")
+            # try:
+            #     # Disable flash attention and memory efficient attention
+            #     self.unet.set_attention_slice(None)
+            #     if hasattr(self.unet, 'set_use_memory_efficient_attention_xformers'):
+            #         self.unet.set_use_memory_efficient_attention_xformers(False)
+            #     if hasattr(self.unet, 'set_attn_processor'):
+            #         from diffusers.models.attention_processor import AttnProcessor
+            #         self.unet.set_attn_processor(AttnProcessor())
+            # except Exception as e:
+            #     print(f"Warning: Could not disable UNet attention optimizations: {e}")
             
         def forward(self, input_latents, timesteps, audio_prompts):
             # Call the UNet model directly
@@ -142,12 +142,12 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
                 do_constant_folding=True,
                 input_names=['input_latents', 'timesteps', 'audio_prompts'],
                 output_names=['noise_prediction'],
-                dynamic_axes={
-                    'input_latents': {0: 'batch_size'},
-                    'timesteps': {0: 'batch_size'},
-                    'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
-                    'noise_prediction': {0: 'batch_size'}
-                },
+                # dynamic_axes={
+                #     'input_latents': {0: 'batch_size'},
+                #     'timesteps': {0: 'batch_size'},
+                #     'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
+                #     'noise_prediction': {0: 'batch_size'}
+                # },
                 verbose=False,
                 training=torch.onnx.TrainingMode.EVAL
             )
@@ -184,12 +184,12 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
                 do_constant_folding=True,
                 input_names=['input_latents', 'timesteps', 'audio_prompts'],
                 output_names=['noise_prediction'],
-                dynamic_axes={
-                    'input_latents': {0: 'batch_size'},
-                    'timesteps': {0: 'batch_size'},
-                    'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
-                    'noise_prediction': {0: 'batch_size'}
-                },
+                # dynamic_axes={
+                #     'input_latents': {0: 'batch_size'},
+                #     'timesteps': {0: 'batch_size'},
+                #     'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
+                #     'noise_prediction': {0: 'batch_size'}
+                # },
                 verbose=False,
                 training=torch.onnx.TrainingMode.EVAL
             )
