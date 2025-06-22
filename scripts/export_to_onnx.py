@@ -68,9 +68,20 @@ from musetalk.models.unet import PositionalEncoding
 from transformers import WhisperModel
 from musetalk.utils.face_parsing import FaceParsing
 
-def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
-    """Export UNet model to ONNX format with external data support"""
-    print(f"Exporting UNet to {output_path} with opset {device}")
+def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18, use_timesteps=False, fixed_timestep=0):
+    """Export UNet model to ONNX format with external data support
+    
+    Args:
+        unet: UNet model to export
+        output_path: Path to save the ONNX model
+        device: Device to use for export
+        opset_version: ONNX opset version
+        use_timesteps: If True, include timesteps as input. If False, use fixed timestep
+        fixed_timestep: Fixed timestep value to use when use_timesteps=False
+    """
+    print(f"Exporting UNet to {output_path} with opset {opset_version}")
+    if not use_timesteps:
+        print(f"  Using fixed timestep: {fixed_timestep} (no timesteps input)")
     
     # Convert path to string to handle both string and Path objects
     output_path = str(output_path)
@@ -79,25 +90,27 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
     device = torch.device('cpu')
     
     class UNetWrapper(torch.nn.Module):
-        def __init__(self, unet_model):
+        def __init__(self, unet_model, use_timesteps=True, fixed_timestep=0):
             super().__init__()
             # UNet class is a wrapper around UNet2DConditionModel
             # Access the actual model
             self.unet = unet_model.model
+            self.use_timesteps = use_timesteps
+            self.fixed_timestep = fixed_timestep
             
-            # Disable attention optimizations for ONNX export
-            # try:
-            #     # Disable flash attention and memory efficient attention
-            #     self.unet.set_attention_slice(None)
-            #     if hasattr(self.unet, 'set_use_memory_efficient_attention_xformers'):
-            #         self.unet.set_use_memory_efficient_attention_xformers(False)
-            #     if hasattr(self.unet, 'set_attn_processor'):
-            #         from diffusers.models.attention_processor import AttnProcessor
-            #         self.unet.set_attn_processor(AttnProcessor())
-            # except Exception as e:
-            #     print(f"Warning: Could not disable UNet attention optimizations: {e}")
+        def forward(self, input_latents, *args):
+            if self.use_timesteps:
+                # Original behavior: timesteps and audio_prompts as separate inputs
+                timesteps, audio_prompts = args
+            else:
+                # Simplified behavior: only audio_prompts, use fixed timestep
+                audio_prompts = args[0]
+                # Create fixed timestep tensor with same batch size as input
+                batch_size = input_latents.shape[0]
+                timesteps = torch.tensor([self.fixed_timestep] * batch_size, 
+                                       device=input_latents.device, 
+                                       dtype=torch.long)
             
-        def forward(self, input_latents, timesteps, audio_prompts):
             # Call the UNet model directly
             result = self.unet(
                 sample=input_latents,
@@ -108,13 +121,33 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
             return result[0]  # Return just the noise prediction
     
     # Ensure model and inputs are on CPU to avoid CUDA issues
-    wrapper = UNetWrapper(unet).to(device)
+    wrapper = UNetWrapper(unet, use_timesteps=use_timesteps, fixed_timestep=fixed_timestep).to(device)
     wrapper.eval()
     
     # Create dummy inputs matching the expected format (always on CPU for export)
     input_latents = torch.randn(1, 8, 32, 32, device=device)  # Concatenated latents
-    timesteps = torch.tensor([0], device=device, dtype=torch.long)
     audio_prompts = torch.randn(1, 50, 384, device=device)
+    
+    if use_timesteps:
+        # Original behavior with timesteps input
+        timesteps = torch.tensor([0], device=device, dtype=torch.long)
+        dummy_inputs = (input_latents, timesteps, audio_prompts)
+        input_names = ['input_latents', 'timesteps', 'audio_prompts']
+        dynamic_axes = {
+            'input_latents': {0: 'batch_size'},
+            'timesteps': {0: 'batch_size'},
+            'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
+            'noise_prediction': {0: 'batch_size'}
+        }
+    else:
+        # Simplified behavior without timesteps input
+        dummy_inputs = (input_latents, audio_prompts)
+        input_names = ['input_latents', 'audio_prompts']
+        dynamic_axes = {
+            'input_latents': {0: 'batch_size'},
+            'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
+            'noise_prediction': {0: 'batch_size'}
+        }
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -131,29 +164,22 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
         # Direct export to file
         torch.onnx.export(
             wrapper,
-            (input_latents, timesteps, audio_prompts),
+            dummy_inputs,
             temp_path,
             export_params=True,
             opset_version=opset_version,
             do_constant_folding=True,
-            input_names=['input_latents', 'timesteps', 'audio_prompts'],
+            input_names=input_names,
             output_names=['noise_prediction'],
-            # dynamic_axes={
-            #     'input_latents': {0: 'batch_size'},
-            #     'timesteps': {0: 'batch_size'},
-            #     'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
-            #     'noise_prediction': {0: 'batch_size'}
-            # },
+            # Uncomment for dynamic batch sizes if needed
+            # dynamic_axes=dynamic_axes,
             verbose=False,
-            dynamo=True,
+            # dynamo=True,
             training=torch.onnx.TrainingMode.EVAL
         )
 
         import onnx
-        # # model = onnx.load(temp_path)
-        
         # Load and convert to external data format
-        # import onnx
         model = onnx.load(temp_path)
         onnx.save_model(
             model, 
@@ -164,13 +190,6 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
             size_threshold=1024
         )
 
-        # model = onnx.load(output_path, load_external_data=True)
-        # model.ir_version = 10
-        # model_simp, check = simplify(model)
-        # # copy original model to output path with .original suffix
-        # shutil.copy(output_path, output_path + ".original")
-        # onnx.save(model_simp, output_path)
-        
         # Clean up temp file
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -889,6 +908,12 @@ def main():
     parser.add_argument("--no-copy-unity", action="store_true", 
                        help="Disable copying to Unity StreamingAssets")
     
+    # UNet-specific options
+    parser.add_argument("--unet-use-timesteps", action="store_true", default=False,
+                       help="Include timesteps as input to UNet (default: False for simplified interface)")
+    parser.add_argument("--unet-fixed-timestep", type=int, default=0,
+                       help="Fixed timestep value to use when --unet-use-timesteps is False (default: 0)")
+    
     args = parser.parse_args()
     
     # Handle quantization and Unity copy flags
@@ -904,6 +929,12 @@ def main():
         print("🍎 Using INT8 quantization - optimal for CPU inference (especially on Mac)")
     else:
         print("📝 Exporting FP32 models only")
+    
+    # Print UNet configuration
+    if not args.unet_use_timesteps:
+        print(f"🎯 UNet simplified mode: Using fixed timestep {args.unet_fixed_timestep} (no timesteps input)")
+    else:
+        print(f"🎯 UNet standard mode: Including timesteps as input")
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -923,6 +954,12 @@ def main():
         unet_model_path = "./models/musetalkV15/unet.pth"
         unet_config_path = "./models/musetalkV15/musetalk.json"
         model_suffix = "_v15"
+    
+    # Add timestep suffix to model name if using simplified mode
+    if not args.unet_use_timesteps and args.unet_fixed_timestep != 0:
+        model_suffix += f"_t{args.unet_fixed_timestep}"
+    elif not args.unet_use_timesteps:
+        model_suffix += ""
     
     models_to_export = args.models
     if "all" in models_to_export:
@@ -965,7 +1002,30 @@ def main():
         if "unet" in models_to_export:
             unet_path = output_dir / f"unet{model_suffix}.onnx"
             try:
-                success_count += export_model_with_quantization(export_unet_to_onnx, unet, unet_path, "UNet", export_int8, device, args.opset_version)
+                # Use custom export function for UNet with timestep options
+                print(f"\n=== Exporting UNet (timesteps: {args.unet_use_timesteps}) ===")
+                if export_unet_to_onnx(unet, unet_path, device, args.opset_version, 
+                                     use_timesteps=args.unet_use_timesteps, 
+                                     fixed_timestep=args.unet_fixed_timestep):
+                    if verify_onnx_model(unet_path):
+                        success_count += 1
+                        print(f"✓ UNet FP32 export successful")
+                        
+                        # Convert to INT8 if requested
+                        if export_int8:
+                            int8_path = str(unet_path).replace('.onnx', '_int8.onnx')
+                            if convert_model_to_int8(str(unet_path), int8_path, "unet"):
+                                if verify_onnx_model(int8_path):
+                                    success_count += 1
+                                    print(f"✓ UNet INT8 quantization successful")
+                                else:
+                                    print(f"✗ UNet INT8 model verification failed")
+                            else:
+                                print(f"✗ UNet INT8 quantization failed")
+                    else:
+                        print(f"✗ UNet FP32 model verification failed")
+                else:
+                    print(f"✗ UNet FP32 export failed")
             except Exception as e:
                 print(f"Failed to export UNet: {e}")
         
@@ -1017,7 +1077,11 @@ def main():
             "int8_exported": export_int8,
             "int8_available": INT8_AVAILABLE,
             "copied_to_unity": copy_to_unity,
-            "success_count": success_count
+            "success_count": success_count,
+            "unet_config": {
+                "use_timesteps": args.unet_use_timesteps,
+                "fixed_timestep": args.unet_fixed_timestep
+            }
         }
         
         config_path = output_dir / f"onnx_config{model_suffix}.json"
