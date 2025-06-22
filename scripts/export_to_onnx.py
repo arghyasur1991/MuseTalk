@@ -126,97 +126,59 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18):
         temp_path = output_path + '_temp.onnx'
     
     print("Attempting to export large UNet model with external data support...")
-    
-    try:
-        # First, try the export
-        with torch.no_grad():
-            # Use BytesIO to capture the model in memory first
-            import io
-            f = io.BytesIO()
-            
-            torch.onnx.export(
-                wrapper,
-                (input_latents, timesteps, audio_prompts),
-                f,
-                export_params=True,
-                opset_version=opset_version,
-                do_constant_folding=True,
-                input_names=['input_latents', 'timesteps', 'audio_prompts'],
-                output_names=['noise_prediction'],
-                # dynamic_axes={
-                #     'input_latents': {0: 'batch_size'},
-                #     'timesteps': {0: 'batch_size'},
-                #     'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
-                #     'noise_prediction': {0: 'batch_size'}
-                # },
-                verbose=False,
-                training=torch.onnx.TrainingMode.EVAL
-            )
-            
-            # Load the model from memory and save with external data
-            f.seek(0)
-            import onnx
-            model = onnx.load(f)
-            
-            # Save with external data format
-            onnx.save_model(
-                model, 
-                output_path,
-                save_as_external_data=True,
-                all_tensors_to_one_file=True,
-                location=f"{os.path.basename(output_path)}.data",
-                size_threshold=1024  # Save all tensors > 1KB externally
-            )
-            print(f"UNet saved with external data to {output_path}")
-            print(f"External data file: {os.path.dirname(output_path)}/{os.path.basename(output_path)}.data")
-            
-    except Exception as e:
-        print(f"Memory-based export failed: {e}")
-        print("Trying direct file export with external data format...")
         
-        try:
-            # Direct export to file
-            torch.onnx.export(
-                wrapper,
-                (input_latents, timesteps, audio_prompts),
-                temp_path,
-                export_params=True,
-                opset_version=opset_version,
-                do_constant_folding=True,
-                input_names=['input_latents', 'timesteps', 'audio_prompts'],
-                output_names=['noise_prediction'],
-                # dynamic_axes={
-                #     'input_latents': {0: 'batch_size'},
-                #     'timesteps': {0: 'batch_size'},
-                #     'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
-                #     'noise_prediction': {0: 'batch_size'}
-                # },
-                verbose=False,
-                training=torch.onnx.TrainingMode.EVAL
-            )
+    try:
+        # Direct export to file
+        torch.onnx.export(
+            wrapper,
+            (input_latents, timesteps, audio_prompts),
+            temp_path,
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            input_names=['input_latents', 'timesteps', 'audio_prompts'],
+            output_names=['noise_prediction'],
+            # dynamic_axes={
+            #     'input_latents': {0: 'batch_size'},
+            #     'timesteps': {0: 'batch_size'},
+            #     'audio_prompts': {0: 'batch_size', 1: 'sequence_length'},
+            #     'noise_prediction': {0: 'batch_size'}
+            # },
+            verbose=False,
+            training=torch.onnx.TrainingMode.EVAL
+        )
+
+        import onnx
+        # # model = onnx.load(temp_path)
+        
+        # Load and convert to external data format
+        # import onnx
+        model = onnx.load(temp_path)
+        onnx.save_model(
+            model, 
+            output_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=f"{os.path.basename(output_path)}.data",
+            size_threshold=1024
+        )
+
+        # model = onnx.load(output_path, load_external_data=True)
+        # model.ir_version = 10
+        # model_simp, check = simplify(model)
+        # # copy original model to output path with .original suffix
+        # shutil.copy(output_path, output_path + ".original")
+        # onnx.save(model_simp, output_path)
+        
+        # Clean up temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
             
-            # Load and convert to external data format
-            import onnx
-            model = onnx.load(temp_path)
-            onnx.save_model(
-                model, 
-                output_path,
-                save_as_external_data=True,
-                all_tensors_to_one_file=True,
-                location=f"{os.path.basename(output_path)}.data",
-                size_threshold=1024
-            )
-            
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                
-            print(f"UNet exported successfully with external data")
-            
-        except Exception as e2:
-            print(f"All export methods failed: {e2}")
-            print("UNet model is too large for current ONNX export capabilities")
-            return None
+        print(f"UNet exported successfully with external data")
+        
+    except Exception as e2:
+        print(f"UNet model is too large for current ONNX export capabilities {e2}")
+        return None
     
     print(f"UNet exported successfully to {output_path}")
     return wrapper
