@@ -13,6 +13,7 @@ import argparse
 import json
 from pathlib import Path
 import shutil
+from onnxsim import simplify
 
 # INT8 quantization support
 try:
@@ -262,8 +263,15 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
         output_names=['latents'],
         # No dynamic_axes --> static shape model
         verbose=False,
-        training=torch.onnx.TrainingMode.EVAL
+        training=torch.onnx.TrainingMode.EVAL,
+        # dynamo=True
     )
+
+    model = onnx.load(output_path)
+    model_simp, check = simplify(model)
+    # copy original model to output path with .original suffix
+    shutil.copy(output_path, output_path + ".original")
+    onnx.save(model_simp, output_path)
     
     # Export to ONNX with dynamic axes for height and width
     # torch.onnx.export(
@@ -332,6 +340,12 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
         verbose=False,
         training=torch.onnx.TrainingMode.EVAL
     )
+
+    model = onnx.load(output_path)
+    model_simp, check = simplify(model)
+    # copy original model to output path with .original suffix
+    shutil.copy(output_path, output_path + ".original")
+    onnx.save(model_simp, output_path)
     
     print(f"VAE Decoder exported successfully to {output_path}")
     return True
