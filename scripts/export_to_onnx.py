@@ -111,7 +111,7 @@ def tune_model(
     onnx.save_model(
         optimizer.model,
         model_path,
-        save_as_external_data=True,
+        save_as_external_data=(model_type == "unet"),
         all_tensors_to_one_file=True,
         location=f"{os.path.basename(model_path)}.data",
         convert_attribute=False,
@@ -300,6 +300,8 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
         # dynamo=True
     )
 
+    tune_model(output_path, "vae", fp16=False)
+
     model = onnx.load(output_path)
     model_simp, check = simplify(model)
     # copy original model to output path with .original suffix
@@ -373,6 +375,8 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
         verbose=False,
         training=torch.onnx.TrainingMode.EVAL
     )
+
+    tune_model(output_path, "vae", fp16=False)
 
     model = onnx.load(output_path)
     model_simp, check = simplify(model)
