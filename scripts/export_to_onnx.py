@@ -92,6 +92,9 @@ def tune_model(
     # On by default in ORT optimizer, turned off because it has no effect
     optimization_options.enable_qordered_matmul = False
     optimization_options.enable_bias_splitgelu = False
+    optimization_options.enable_bias_add = False
+    optimization_options.enable_skip_layer_norm = model_type != "unet"
+    optimization_options.enable_gelu = model_type != "unet"
     optimizer = optimize_model(
         input = model_path,
         model_type = model_type,
@@ -245,6 +248,20 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18, use_t
             os.remove(temp_path)
 
         tune_model(output_path, "unet", fp16=False)
+        fp16_path = output_path.replace('.onnx', '_fp16.onnx')
+        shutil.copy(output_path, fp16_path)
+        tune_model(fp16_path, "unet", fp16=True)
+
+        model = onnx.load(fp16_path)
+        model = patch_pow_constants(model)
+        model_simp, check = simplify(model)
+        # copy original model to output path with .original suffix
+        shutil.copy(fp16_path, fp16_path + ".original")
+        onnx.save(model_simp, fp16_path)
+
+        # model = onnx.load(output_path)
+        # model = patch_pow_constants(model)
+        # model_simp, check = simplify(model)
             
         print(f"UNet exported successfully with external data")
         
