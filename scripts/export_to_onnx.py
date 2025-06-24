@@ -1258,7 +1258,7 @@ def main():
             except Exception as e:
                 print(f"Failed to export Whisper: {e}")
         
-        if "face_parsing" in models_to_export and 'fp' in locals():
+        if "face_parsing" in models_to_export:
             face_parsing_path = output_dir / "face_parsing.onnx"
             try:
                 success_count += export_model_with_precisions(
