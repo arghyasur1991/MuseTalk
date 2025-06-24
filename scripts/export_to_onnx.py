@@ -937,24 +937,24 @@ def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
     
     # Models to copy (FP32 and INT8 versions, VAE decoder FP32 only for quality)
     models_to_copy = [
-        f"unet{model_suffix}.onnx",
-        f"unet{model_suffix}_int8.onnx",
-        f"vae_encoder{model_suffix}.onnx",  # FP32 version
-        f"vae_encoder{model_suffix}_int8.onnx",  # INT8 version for performance testing
-        f"vae_decoder{model_suffix}.onnx",  # FP32 only for quality
-        f"positional_encoding{model_suffix}.onnx",
-        f"positional_encoding{model_suffix}_int8.onnx",
+        f"unet.onnx",
+        f"unet_int8.onnx",
+        f"vae_encoder.onnx",  # FP32 version
+        f"vae_encoder_int8.onnx",  # INT8 version for performance testing
+        f"vae_decoder.onnx",  # FP32 only for quality
+        f"positional_encoding.onnx",
+        f"positional_encoding_int8.onnx",
         "whisper_encoder.onnx",
         "whisper_encoder_int8.onnx",
         "face_parsing.onnx",
         "face_parsing_int8.onnx",
-        f"onnx_config{model_suffix}.json"
+        f"onnx_config.json"
     ]
     
     # Copy external data files for large models (only UNet needs external data now)
     external_data_files = [
-        f"unet{model_suffix}.onnx.data",
-        f"unet{model_suffix}_int8.onnx.data"
+        f"unet.onnx.data",
+        f"unet_int8.onnx.data"
     ]
     
     for model_file in models_to_copy:
@@ -1049,7 +1049,7 @@ def main():
                        default=["all"], help="Models to export")
     parser.add_argument("--opset_version", type=int, default=18,
                        help="ONNX opset version to use (11-18)")
-    parser.add_argument("--int8", action="store_true", default=True,
+    parser.add_argument("--int8", action="store_true", default=False,
                        help="Export INT8 quantized models (CPU-optimized, default: True)")
     parser.add_argument("--no-int8", action="store_true", 
                        help="Disable INT8 quantization")
@@ -1150,7 +1150,7 @@ def main():
         success_count = 0
         
         if "unet" in models_to_export:
-            unet_path = output_dir / f"unet{model_suffix}.onnx"
+            unet_path = output_dir / f"unet.onnx"
             try:
                 # Use custom export function for UNet with timestep options
                 print(f"\n=== Exporting UNet (timesteps: {args.unet_use_timesteps}) ===")
@@ -1180,21 +1180,21 @@ def main():
                 print(f"Failed to export UNet: {e}")
         
         if "vae_encoder" in models_to_export:
-            vae_encoder_path = output_dir / f"vae_encoder{model_suffix}.onnx"
+            vae_encoder_path = output_dir / f"vae_encoder.onnx"
             try:
                 success_count += export_model_with_quantization(export_vae_encoder_to_onnx, vae, vae_encoder_path, "VAE Encoder", export_int8, device, args.opset_version)
             except Exception as e:
                 print(f"Failed to export VAE Encoder: {e}")
         
         if "vae_decoder" in models_to_export:
-            vae_decoder_path = output_dir / f"vae_decoder{model_suffix}.onnx"
+            vae_decoder_path = output_dir / f"vae_decoder.onnx"
             try:
                 success_count += export_model_with_quantization(export_vae_decoder_to_onnx, vae, vae_decoder_path, "VAE Decoder", export_int8, device, args.opset_version)
             except Exception as e:
                 print(f"Failed to export VAE Decoder: {e}")
         
         if "pe" in models_to_export:
-            pe_path = output_dir / f"positional_encoding{model_suffix}.onnx"
+            pe_path = output_dir / f"positional_encoding.onnx"
             try:
                 success_count += export_model_with_quantization(export_positional_encoding_to_onnx, pe, pe_path, "Positional Encoding", export_int8, device, args.opset_version)
             except Exception as e:
@@ -1234,7 +1234,7 @@ def main():
             }
         }
         
-        config_path = output_dir / f"onnx_config{model_suffix}.json"
+        config_path = output_dir / f"onnx_config.json"
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)
         
