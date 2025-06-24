@@ -1046,7 +1046,7 @@ def export_model_with_precisions(export_func, model, base_path, model_name, expo
     model_type = model_name.lower().replace(" ", "_")
     
     # Create precision-specific paths
-    fp32_path = base_path_str.replace('.onnx', '_fp32.onnx')
+    fp32_path = base_path_str
     fp16_path = base_path_str.replace('.onnx', '_fp16.onnx')
     int8_path = base_path_str.replace('.onnx', '_int8.onnx')
     
