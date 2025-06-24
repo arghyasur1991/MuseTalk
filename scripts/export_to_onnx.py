@@ -108,6 +108,10 @@ def tune_model(
         keep_io_types=True, disable_shape_infer=True, op_block_list=['RandomNormalLike']
     )
     optimizer.topological_sort()
+
+    data_location = f"{model_path}.data"
+    if os.path.exists(data_location):
+        os.remove(data_location)
         
     # shutil.rmtree(model_dir)
     # os.mkdir(model_dir)
@@ -115,7 +119,7 @@ def tune_model(
     onnx.save_model(
         optimizer.model,
         model_path,
-        save_as_external_data=(model_type == "unet"),
+        save_as_external_data=(model_type == "unet" and not fp16),
         all_tensors_to_one_file=True,
         location=f"{os.path.basename(model_path)}.data",
         convert_attribute=False,
@@ -231,6 +235,10 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18, use_t
             training=torch.onnx.TrainingMode.EVAL
         )
 
+        data_location = f"{output_path}.data"
+        if os.path.exists(data_location):
+            os.remove(data_location)
+
         import onnx
         # Load and convert to external data format
         model = onnx.load(temp_path)
@@ -248,20 +256,12 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18, use_t
             os.remove(temp_path)
 
         tune_model(output_path, "unet", fp16=False)
-        fp16_path = output_path.replace('.onnx', '_fp16.onnx')
-        shutil.copy(output_path, fp16_path)
-        tune_model(fp16_path, "unet", fp16=True)
-
-        model = onnx.load(fp16_path)
-        model = patch_pow_constants(model)
-        model_simp, check = simplify(model)
-        # copy original model to output path with .original suffix
-        shutil.copy(fp16_path, fp16_path + ".original")
-        onnx.save(model_simp, fp16_path)
-
+        
+        # [DON'T UNCOMMENT] Apply post-processing optimizations [doesn't work so commented out]
         # model = onnx.load(output_path)
         # model = patch_pow_constants(model)
         # model_simp, check = simplify(model)
+        # onnx.save(model_simp, output_path)
             
         print(f"UNet exported successfully with external data")
         
@@ -376,22 +376,11 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     )
 
     tune_model(output_path, "vae", fp16=False)
-    fp16_path = output_path.replace('.onnx', '_fp16.onnx')
-    shutil.copy(output_path, fp16_path)
-    tune_model(fp16_path, "vae", fp16=True)
 
+    # Apply post-processing optimizations
     model = onnx.load(output_path)
     model_simp, check = simplify(model)
-    # copy original model to output path with .original suffix
-    shutil.copy(output_path, output_path + ".original")
     onnx.save(model_simp, output_path)
-
-    model = onnx.load(fp16_path)
-    model = patch_pow_constants(model)
-    model_simp, check = simplify(model)
-    # copy original model to output path with .original suffix
-    shutil.copy(fp16_path, fp16_path + ".original")
-    onnx.save(model_simp, fp16_path)
     
     # Export to ONNX with dynamic axes for height and width
     # torch.onnx.export(
@@ -462,22 +451,11 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     )
 
     tune_model(output_path, "vae", fp16=False)
-    fp16_path = output_path.replace('.onnx', '_fp16.onnx')
-    shutil.copy(output_path, fp16_path)
-    tune_model(fp16_path, "vae", fp16=True)
 
+    # Apply post-processing optimizations
     model = onnx.load(output_path)
     model_simp, check = simplify(model)
-    # copy original model to output path with .original suffix
-    shutil.copy(output_path, output_path + ".original")
     onnx.save(model_simp, output_path)
-
-    model = onnx.load(fp16_path)
-    model = patch_pow_constants(model)
-    model_simp, check = simplify(model)
-    # copy original model to output path with .original suffix
-    shutil.copy(fp16_path, fp16_path + ".original")
-    onnx.save(model_simp, fp16_path)
     
     print(f"VAE Decoder exported successfully to {output_path}")
     return True
@@ -892,6 +870,38 @@ def convert_model_to_int8_alternative(fp32_model_path, int8_model_path, model_ty
         print(f"✗ Failed to convert {fp32_model_path} to INT8 (all methods): {e}")
         return False
 
+def convert_model_to_fp16(fp32_model_path, fp16_model_path, model_type="general"):
+    """Convert FP32 ONNX model to FP16"""
+    try:
+        print(f"Converting {fp32_model_path} to FP16...")
+        
+        # Copy the FP32 model first
+        shutil.copy(fp32_model_path, fp16_model_path)
+        
+        # Copy external data file if exists
+        fp16_data_location = f"{fp16_model_path}.data"
+        if os.path.exists(fp16_data_location):
+            os.remove(fp16_data_location)
+        
+        # Apply FP16 conversion using tune_model
+        tune_model(fp16_model_path, model_type, fp16=True)
+        
+        # Apply post-processing optimizations
+        model = onnx.load(fp16_model_path)
+        model = patch_pow_constants(model)
+        model_simp, check = simplify(model)
+        
+        # Save original model as backup
+        shutil.copy(fp16_model_path, fp16_model_path + ".original")
+        onnx.save(model_simp, fp16_model_path)
+        
+        print(f"✓ FP16 model saved to {fp16_model_path}")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Failed to convert {fp32_model_path} to FP16: {e}")
+        return False
+
 def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general"):
     """Convert FP32 ONNX model to INT8 using best approach for Mac compatibility"""
     if not INT8_AVAILABLE:
@@ -923,7 +933,41 @@ def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general"
         print(f"✗ Failed to convert {fp32_model_path} to INT8: {e}")
         return False
 
-def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
+def cleanup_export_directory(output_dir):
+    """Clean up export directory, keeping only .onnx, .onnx.data, and config.json files"""
+    print(f"\n🧹 Cleaning up export directory: {output_dir}")
+    
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return
+    
+    kept_files = []
+    removed_files = []
+    
+    for file_path in output_path.iterdir():
+        if file_path.is_file():
+            filename = file_path.name
+            
+            # Keep these files
+            if (filename.endswith('.onnx') or 
+                filename.endswith('.onnx.data') or 
+                filename == 'onnx_config.json'):
+                kept_files.append(filename)
+            else:
+                # Remove everything else
+                try:
+                    file_path.unlink()
+                    removed_files.append(filename)
+                except Exception as e:
+                    print(f"⚠️ Failed to remove {filename}: {e}")
+    
+    print(f"✓ Kept {len(kept_files)} essential files: {', '.join(kept_files)}")
+    if removed_files:
+        print(f"🗑️ Removed {len(removed_files)} temporary files")
+    else:
+        print("📝 No temporary files to remove")
+
+def copy_to_streaming_assets(source_dir):
     """Copy exported models to Unity StreamingAssets folder"""
     # Define StreamingAssets path
     unity_streaming_assets = Path("../MysteryAI/Assets/StreamingAssets/LiveTalk")
@@ -935,26 +979,34 @@ def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
     source_path = Path(source_dir)
     copied_files = []
     
-    # Models to copy (FP32 and INT8 versions, VAE decoder FP32 only for quality)
+    # Models to copy (all precision variants)
     models_to_copy = [
-        f"unet.onnx",
-        f"unet_int8.onnx",
-        f"vae_encoder.onnx",  # FP32 version
-        f"vae_encoder_int8.onnx",  # INT8 version for performance testing
-        f"vae_decoder.onnx",  # FP32 only for quality
-        f"positional_encoding.onnx",
-        f"positional_encoding_int8.onnx",
-        "whisper_encoder.onnx",
+        "unet_fp32.onnx",
+        "unet_fp16.onnx", 
+        "unet_int8.onnx",
+        "vae_encoder_fp32.onnx",
+        "vae_encoder_fp16.onnx",
+        "vae_encoder_int8.onnx",
+        "vae_decoder_fp32.onnx",
+        "vae_decoder_fp16.onnx",
+        "vae_decoder_int8.onnx",
+        "positional_encoding_fp32.onnx",
+        "positional_encoding_fp16.onnx",
+        "positional_encoding_int8.onnx",
+        "whisper_encoder_fp32.onnx",
+        "whisper_encoder_fp16.onnx",
         "whisper_encoder_int8.onnx",
-        "face_parsing.onnx",
+        "face_parsing_fp32.onnx",
+        "face_parsing_fp16.onnx",
         "face_parsing_int8.onnx",
-        f"onnx_config.json"
+        "onnx_config.json"
     ]
     
-    # Copy external data files for large models (only UNet needs external data now)
+    # Copy external data files for large models
     external_data_files = [
-        f"unet.onnx.data",
-        f"unet_int8.onnx.data"
+        "unet_fp32.onnx.data",
+        "unet_fp16.onnx.data",
+        "unet_int8.onnx.data"
     ]
     
     for model_file in models_to_copy:
@@ -987,59 +1039,67 @@ def copy_to_streaming_assets(source_dir, model_suffix="_v15"):
     print(f"\n✓ Successfully copied {len(copied_files)} files to StreamingAssets")
     return copied_files
 
-def export_model_with_quantization(export_func, model, output_path, model_name, export_int8=True, device="cpu", opset_version=18, **kwargs):
-    """Export model in FP32 and INT8 formats"""
-    # Convert path to string and create variant paths
-    fp32_path = str(output_path)
-    int8_path = fp32_path.replace('.onnx', '_int8.onnx')
-    
+def export_model_with_precisions(export_func, model, base_path, model_name, export_fp32=True, export_fp16=False, export_int8=False, device="cpu", opset_version=18, **kwargs):
+    """Export model in multiple precision formats"""
     success_count = 0
-    
-    # Extract model type for INT8 quantization
+    base_path_str = str(base_path)
     model_type = model_name.lower().replace(" ", "_")
     
-    # Skip INT8 only for VAE decoder (most sensitive to quality loss)
-    # VAE encoder can handle INT8 better, so we'll export both versions
-    if model_type == "vae_decoder":
-        print(f"✓ Exporting both FP32 and INT8 for {model_name} (runtime will choose best)")
-        # export_int8 = False
-    elif model_type == "vae_encoder":
-        print(f"✓ Exporting both FP32 and INT8 for {model_name} (runtime will choose best)")
-        # export_int8 remains True
+    # Create precision-specific paths
+    fp32_path = base_path_str.replace('.onnx', '_fp32.onnx')
+    fp16_path = base_path_str.replace('.onnx', '_fp16.onnx')
+    int8_path = base_path_str.replace('.onnx', '_int8.onnx')
     
-    # Export FP32 model
-    try:
-        print(f"\n=== Exporting {model_name} (FP32) ===")
-        if export_func(model, fp32_path, device, opset_version, **kwargs):
-            if verify_onnx_model(fp32_path):
-                success_count += 1
-                print(f"✓ {model_name} FP32 export successful")
-                
-                # Convert to INT8 if requested (CPU-optimized)
-                if export_int8:
-                    if convert_model_to_int8(fp32_path, int8_path, model_type):
-                        if verify_onnx_model(int8_path):
-                            success_count += 1
-                            print(f"✓ {model_name} INT8 quantization successful")
+    # Export FP32 model first (base model)
+    if export_fp32 or export_fp16 or export_int8:  # Need FP32 as base for conversions
+        try:
+            print(f"\n=== Exporting {model_name} (FP32) ===")
+            if export_func(model, fp32_path, device, opset_version, **kwargs):
+                if verify_onnx_model(fp32_path):
+                    if export_fp32:
+                        success_count += 1
+                        print(f"✓ {model_name} FP32 export successful")
+                    
+                    # Convert to FP16 if requested
+                    if export_fp16:
+                        if convert_model_to_fp16(fp32_path, fp16_path, model_type):
+                            if verify_onnx_model(fp16_path):
+                                success_count += 1
+                                print(f"✓ {model_name} FP16 conversion successful")
+                            else:
+                                print(f"✗ {model_name} FP16 model verification failed")
                         else:
-                            print(f"✗ {model_name} INT8 model verification failed")
-                    else:
-                        print(f"✗ {model_name} INT8 quantization failed")
+                            print(f"✗ {model_name} FP16 conversion failed")
+                    
+                    # Convert to INT8 if requested
+                    if export_int8:
+                        if convert_model_to_int8(fp32_path, int8_path, model_type):
+                            if verify_onnx_model(int8_path):
+                                success_count += 1
+                                print(f"✓ {model_name} INT8 quantization successful")
+                            else:
+                                print(f"✗ {model_name} INT8 model verification failed")
+                        else:
+                            print(f"✗ {model_name} INT8 quantization failed")
+                    
+                    # Remove FP32 if not requested (was only needed for conversion)
+                    if not export_fp32 and os.path.exists(fp32_path):
+                        os.remove(fp32_path)
+                        # Also remove external data file if exists
+                        fp32_data = fp32_path + ".data"
+                        if os.path.exists(fp32_data):
+                            os.remove(fp32_data)
                 else:
-                    print(f"⚠️ Skipping INT8 quantization for {model_name}")
+                    print(f"✗ {model_name} FP32 model verification failed")
             else:
-                print(f"✗ {model_name} FP32 model verification failed")
-        else:
-            print(f"✗ {model_name} FP32 export failed")
-    except Exception as e:
-        print(f"✗ Failed to export {model_name}: {e}")
+                print(f"✗ {model_name} FP32 export failed")
+        except Exception as e:
+            print(f"✗ Failed to export {model_name}: {e}")
     
     return success_count
 
 def main():
     parser = argparse.ArgumentParser(description="Export MuseTalk models to ONNX")
-    parser.add_argument("--version", choices=["v1.0", "v1.5"], default="v1.5", 
-                       help="MuseTalk version to export")
     parser.add_argument("--output_dir", default="./models/onnx", 
                        help="Output directory for ONNX models")
     parser.add_argument("--device", default="cpu", 
@@ -1049,10 +1109,8 @@ def main():
                        default=["all"], help="Models to export")
     parser.add_argument("--opset_version", type=int, default=18,
                        help="ONNX opset version to use (11-18)")
-    parser.add_argument("--int8", action="store_true", default=False,
-                       help="Export INT8 quantized models (CPU-optimized, default: True)")
-    parser.add_argument("--no-int8", action="store_true", 
-                       help="Disable INT8 quantization")
+    parser.add_argument("--precision", choices=["all", "fp32", "fp16", "floating", "int8"], 
+                       default="floating", help="Precision to export: all (fp32+fp16+int8), fp32, fp16, floating (fp32+fp16), int8")
     parser.add_argument("--copy-to-unity", action="store_true", default=True,
                        help="Copy exported models to Unity StreamingAssets (default: True)")
     parser.add_argument("--no-copy-unity", action="store_true", 
@@ -1066,19 +1124,24 @@ def main():
     
     args = parser.parse_args()
     
-    # Handle quantization and Unity copy flags
-    export_int8 = args.int8 and not args.no_int8 and INT8_AVAILABLE
+    # Handle precision and Unity copy flags
     copy_to_unity = args.copy_to_unity and not args.no_copy_unity
     
-    if args.int8 and not INT8_AVAILABLE:
+    # Determine which precisions to export
+    export_fp32 = args.precision in ["all", "fp32", "floating"]
+    export_fp16 = args.precision in ["all", "fp16", "floating"]
+    export_int8 = args.precision in ["all", "int8"] and INT8_AVAILABLE
+    
+    if args.precision in ["all", "int8"] and not INT8_AVAILABLE:
         print("⚠️ INT8 quantization requested but onnxruntime quantization not available")
         export_int8 = False
     
-    # Recommend INT8 for CPU-only setups
-    if export_int8:
-        print("🍎 Using INT8 quantization - optimal for CPU inference (especially on Mac)")
-    else:
-        print("📝 Exporting FP32 models only")
+    # Print precision configuration
+    precisions = []
+    if export_fp32: precisions.append("FP32")
+    if export_fp16: precisions.append("FP16")
+    if export_int8: precisions.append("INT8")
+    print(f"📝 Exporting models in precision(s): {', '.join(precisions)}")
     
     # Print UNet configuration
     if not args.unet_use_timesteps:
@@ -1095,21 +1158,9 @@ def main():
     print(f"Using device: {device}")
     print(f"Using ONNX opset version: {args.opset_version}")
     
-    # Load models based on version
-    if args.version == "v1.0":
-        unet_model_path = "./models/musetalk/pytorch_model.bin"
-        unet_config_path = "./models/musetalk/musetalk.json"
-        model_suffix = "_v1"
-    else:  # v1.5
-        unet_model_path = "./models/musetalkV15/unet.pth"
-        unet_config_path = "./models/musetalkV15/musetalk.json"
-        model_suffix = "_v15"
-    
-    # Add timestep suffix to model name if using simplified mode
-    if not args.unet_use_timesteps and args.unet_fixed_timestep != 0:
-        model_suffix += f"_t{args.unet_fixed_timestep}"
-    elif not args.unet_use_timesteps:
-        model_suffix += ""
+    # Load models (only v1.5 supported for ONNX)
+    unet_model_path = "./models/musetalkV15/unet.pth"
+    unet_config_path = "./models/musetalkV15/musetalk.json"
     
     models_to_export = args.models
     if "all" in models_to_export:
@@ -1124,6 +1175,11 @@ def main():
             unet_config=unet_config_path,
             device=device
         )
+
+        # clean directory
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         
         # Load Whisper model
         whisper_dir = "./models/whisper"
@@ -1150,67 +1206,65 @@ def main():
         success_count = 0
         
         if "unet" in models_to_export:
-            unet_path = output_dir / f"unet.onnx"
+            unet_path = output_dir / "unet.onnx"
             try:
                 # Use custom export function for UNet with timestep options
                 print(f"\n=== Exporting UNet (timesteps: {args.unet_use_timesteps}) ===")
-                if export_unet_to_onnx(unet, unet_path, device, args.opset_version, 
-                                     use_timesteps=args.unet_use_timesteps, 
-                                     fixed_timestep=args.unet_fixed_timestep):
-                    if verify_onnx_model(unet_path):
-                        success_count += 1
-                        print(f"✓ UNet FP32 export successful")
-                        
-                        # Convert to INT8 if requested
-                        if export_int8:
-                            int8_path = str(unet_path).replace('.onnx', '_int8.onnx')
-                            if convert_model_to_int8(str(unet_path), int8_path, "unet"):
-                                if verify_onnx_model(int8_path):
-                                    success_count += 1
-                                    print(f"✓ UNet INT8 quantization successful")
-                                else:
-                                    print(f"✗ UNet INT8 model verification failed")
-                            else:
-                                print(f"✗ UNet INT8 quantization failed")
-                    else:
-                        print(f"✗ UNet FP32 model verification failed")
-                else:
-                    print(f"✗ UNet FP32 export failed")
+                success_count += export_model_with_precisions(
+                    export_unet_to_onnx, unet, unet_path, "UNet", 
+                    export_fp32, export_fp16, export_int8, device, args.opset_version,
+                    use_timesteps=args.unet_use_timesteps, fixed_timestep=args.unet_fixed_timestep
+                )
             except Exception as e:
                 print(f"Failed to export UNet: {e}")
         
         if "vae_encoder" in models_to_export:
-            vae_encoder_path = output_dir / f"vae_encoder.onnx"
+            vae_encoder_path = output_dir / "vae_encoder.onnx"
             try:
-                success_count += export_model_with_quantization(export_vae_encoder_to_onnx, vae, vae_encoder_path, "VAE Encoder", export_int8, device, args.opset_version)
+                success_count += export_model_with_precisions(
+                    export_vae_encoder_to_onnx, vae, vae_encoder_path, "VAE Encoder",
+                    export_fp32, export_fp16, export_int8, device, args.opset_version
+                )
             except Exception as e:
                 print(f"Failed to export VAE Encoder: {e}")
         
         if "vae_decoder" in models_to_export:
-            vae_decoder_path = output_dir / f"vae_decoder.onnx"
+            vae_decoder_path = output_dir / "vae_decoder.onnx"
             try:
-                success_count += export_model_with_quantization(export_vae_decoder_to_onnx, vae, vae_decoder_path, "VAE Decoder", export_int8, device, args.opset_version)
+                success_count += export_model_with_precisions(
+                    export_vae_decoder_to_onnx, vae, vae_decoder_path, "VAE Decoder",
+                    export_fp32, export_fp16, export_int8, device, args.opset_version
+                )
             except Exception as e:
                 print(f"Failed to export VAE Decoder: {e}")
         
         if "pe" in models_to_export:
-            pe_path = output_dir / f"positional_encoding.onnx"
+            pe_path = output_dir / "positional_encoding.onnx"
             try:
-                success_count += export_model_with_quantization(export_positional_encoding_to_onnx, pe, pe_path, "Positional Encoding", export_int8, device, args.opset_version)
+                success_count += export_model_with_precisions(
+                    export_positional_encoding_to_onnx, pe, pe_path, "Positional Encoding",
+                    export_fp32, export_fp16, export_int8, device, args.opset_version
+                )
             except Exception as e:
                 print(f"Failed to export Positional Encoding: {e}")
         
         if "whisper" in models_to_export and 'whisper' in locals():
             whisper_path = output_dir / "whisper_encoder.onnx"
             try:
-                success_count += export_model_with_quantization(export_whisper_to_onnx, whisper, whisper_path, "Whisper", export_int8, device, args.opset_version)
+                success_count += export_model_with_precisions(
+                    export_whisper_to_onnx, whisper, whisper_path, "Whisper",
+                    export_fp32, export_fp16, export_int8, device, args.opset_version
+                )
             except Exception as e:
                 print(f"Failed to export Whisper: {e}")
         
         if "face_parsing" in models_to_export and 'fp' in locals():
             face_parsing_path = output_dir / "face_parsing.onnx"
             try:
-                success_count += export_model_with_quantization(export_face_parsing_to_onnx, fp, face_parsing_path, "Face Parsing", export_int8, device, args.opset_version)
+                success_count += export_model_with_precisions(
+                    export_face_parsing_to_onnx, fp, face_parsing_path, "Face Parsing",
+                    export_fp32, export_fp16, export_int8, device, args.opset_version
+                )
             except Exception as e:
                 print(f"Failed to export Face Parsing: {e}")
         
@@ -1219,12 +1273,15 @@ def main():
         
         # Save model configuration
         config = {
-            "version": args.version,
-            "model_suffix": model_suffix,
             "exported_models": models_to_export,
             "device": str(device),
             "opset_version": args.opset_version,
-            "int8_exported": export_int8,
+            "precision": args.precision,
+            "precisions_exported": {
+                "fp32": export_fp32,
+                "fp16": export_fp16,  
+                "int8": export_int8
+            },
             "int8_available": INT8_AVAILABLE,
             "copied_to_unity": copy_to_unity,
             "success_count": success_count,
@@ -1234,7 +1291,7 @@ def main():
             }
         }
         
-        config_path = output_dir / f"onnx_config.json"
+        config_path = output_dir / "onnx_config.json"
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)
         
@@ -1242,7 +1299,10 @@ def main():
         
         # Copy models to StreamingAssets
         if copy_to_unity:
-            copied_files = copy_to_streaming_assets(output_dir, model_suffix)
+            copied_files = copy_to_streaming_assets(output_dir)
+        
+        # Clean up temporary files
+        cleanup_export_directory(output_dir)
         
     except Exception as e:
         print(f"Error during export: {e}")
