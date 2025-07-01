@@ -333,236 +333,270 @@ def make_coreml_compatible(model):
     """
     Make ONNX model compatible with CoreML by addressing input dimension > 16384 issues.
     CoreML has a limitation where input dimensions cannot exceed 16384.
-    This function comprehensively handles the tensor flow through the graph.
+    This function replaces problematic normalization patterns with CoreML-friendly alternatives.
     """
     import onnx
     from onnx import helper, numpy_helper, TensorProto
     import numpy as np
     
-    print("Applying comprehensive CoreML compatibility transformations...")
+    print("Applying CoreML compatibility transformations...")
     
-    # Keep track of all problematic tensor shapes
-    problematic_tensors = set()
+    # Find problematic patterns: Reshape[4D→3D] -> Normalization -> [Mul/Add operations] -> Reshape[3D→4D]
+    problematic_patterns = []
     
-    # First pass: identify all tensors with problematic shapes
-    all_tensor_shapes = {}
-    
-    # Extract shapes from all sources
-    for value_info in model.graph.value_info:
-        if value_info.type.tensor_type.shape:
-            shape = []
-            for dim in value_info.type.tensor_type.shape.dim:
-                if dim.dim_value > 0:
-                    shape.append(dim.dim_value)
-                else:
-                    shape.append(-1)
-            all_tensor_shapes[value_info.name] = shape
-            # Check if this tensor has problematic dimensions
-            if len(shape) >= 3 and len([d for d in shape if d > 16384]) > 0:
-                problematic_tensors.add(value_info.name)
-                print(f"Found problematic tensor: {value_info.name} with shape {shape}")
-    
-    # Also check inputs and outputs
-    for input_info in model.graph.input:
-        if input_info.type.tensor_type.shape:
-            shape = []
-            for dim in input_info.type.tensor_type.shape.dim:
-                if dim.dim_value > 0:
-                    shape.append(dim.dim_value)
-                else:
-                    shape.append(-1)
-            all_tensor_shapes[input_info.name] = shape
-    
-    for output_info in model.graph.output:
-        if output_info.type.tensor_type.shape:
-            shape = []
-            for dim in output_info.type.tensor_type.shape.dim:
-                if dim.dim_value > 0:
-                    shape.append(dim.dim_value)
-                else:
-                    shape.append(-1)
-            all_tensor_shapes[output_info.name] = shape
-    
-    print(f"Found {len(problematic_tensors)} problematic tensors out of {len(all_tensor_shapes)} total tensors")
-    
-    # Debug: List all problematic tensor names
-    if problematic_tensors:
-        print("Problematic tensor names:")
-        for tensor_name in sorted(problematic_tensors):
-            print(f"  - {tensor_name}: {all_tensor_shapes[tensor_name]}")
-    
-    # Second pass: modify Reshape operations that create problematic shapes
-    new_initializers = []
-    additional_nodes = []
-    nodes_to_modify = []
-    reshapes_modified = 0
-    
-    for i, node in enumerate(model.graph.node):
-        if node.op_type == "Reshape":
-            output_name = node.output[0]
-            shape_input = node.input[1]
-            
-            # Check if this reshape creates a problematic output
-            if output_name in problematic_tensors or (output_name in all_tensor_shapes and 
-                len([d for d in all_tensor_shapes[output_name] if d > 16384]) > 0):
-                
-                print(f"Processing problematic Reshape node: {node.name or f'reshape_{i}'}")
-                print(f"  Output tensor: {output_name}")
-                
-                # Find the target shape
-                target_shape = None
-                shape_initializer = None
+    for i in range(len(model.graph.node) - 2):
+        node1 = model.graph.node[i]
+        
+        # Look for initial Reshape that creates 3D tensor
+        if node1.op_type == "Reshape":
+            # Check if this reshape creates 3D tensor with potential large dimensions
+            shape_input = node1.input[1] if len(node1.input) > 1 else None
+            if shape_input:
                 for init in model.graph.initializer:
                     if init.name == shape_input:
                         target_shape = numpy_helper.to_array(init)
-                        shape_initializer = init
+                        # Look for [0, channels, -1] pattern that creates large last dimension
+                        if len(target_shape) == 3 and target_shape[2] == -1:
+                            # Found problematic initial reshape, now look for the complete pattern
+                            pattern_nodes = [i]  # Start with the reshape
+                            current_output = node1.output[0]
+                            pattern_found = False
+                            final_reshape_idx = None
+                            norm_type = None
+                            
+                            # Trace through the graph to find the core Reshape->Norm->Reshape pattern
+                            for j in range(i + 1, min(i + 4, len(model.graph.node))):  # Look ahead up to 3 nodes
+                                candidate_node = model.graph.node[j]
+                                
+                                # Check if this node uses the current output tensor
+                                if current_output in candidate_node.input:
+                                    pattern_nodes.append(j)
+                                    
+                                    # Check if this is a normalization node
+                                    if candidate_node.op_type in ["InstanceNormalization", "GroupNormalization"]:
+                                        norm_type = candidate_node.op_type
+                                        current_output = candidate_node.output[0]
+                                    # Check if this is the second reshape (after normalization)
+                                    elif candidate_node.op_type == "Reshape" and norm_type:
+                                        final_reshape_idx = j
+                                        pattern_found = True
+                                        break
+                                    else:
+                                        # Not part of our core pattern
+                                        break
+                            
+                            if pattern_found and norm_type and final_reshape_idx:
+                                print(f"Found complex normalization pattern starting at {node1.name}")
+                                print(f"  Pattern nodes: {[model.graph.node[idx].name for idx in pattern_nodes]}")
+                                print(f"  Normalization type: {norm_type}")
+                                print(f"  Reshape shape: {target_shape}")
+                                problematic_patterns.append((pattern_nodes, norm_type, node1.input[0], model.graph.node[final_reshape_idx].output[0]))
                         break
-                
-                if target_shape is not None:
-                    print(f"  Original target shape: {target_shape}")
-                    
-                    # Create a modified shape that breaks down large dimensions
-                    new_shape = decompose_large_dimensions(target_shape)
-                    
-                    if not np.array_equal(new_shape, target_shape):
-                        print(f"  New target shape: {new_shape}")
-                        reshapes_modified += 1
-                        
-                        # Update the shape initializer
-                        new_shape_array = np.array(new_shape, dtype=target_shape.dtype)
-                        new_shape_init = numpy_helper.from_array(new_shape_array, shape_input)
-                        new_initializers.append((shape_input, new_shape_init))
-                        
-                        # Update the tensor shape tracking
-                        all_tensor_shapes[output_name] = list(new_shape)
-                        
-                        # Remove from problematic tensors if fixed
-                        if len([d for d in new_shape if d > 16384]) == 0:
-                            problematic_tensors.discard(output_name)
-                            print(f"  ✓ Fixed tensor {output_name}")
-                        else:
-                            print(f"  ⚠ Tensor {output_name} still has large dimensions")
-                    else:
-                        print(f"  No modification needed for {output_name}")
-                else:
-                    print(f"  Could not find shape initializer for {shape_input}")
     
-    print(f"Modified {reshapes_modified} Reshape operations")
+    print(f"Found {len(problematic_patterns)} problematic normalization patterns")
     
-    # Apply the shape modifications
-    applied_modifications = 0
-    for shape_name, new_init in new_initializers:
-        for j, init in enumerate(model.graph.initializer):
-            if init.name == shape_name:
-                model.graph.initializer[j].CopyFrom(new_init)
-                applied_modifications += 1
-                print(f"Updated initializer {shape_name}")
+    # Replace each pattern with a single 4D normalization
+    nodes_to_remove = set()
+    new_nodes = []
+    
+    for pattern_nodes, norm_type, input_tensor, output_tensor in problematic_patterns:
+        # Get the original normalization node to copy attributes from
+        norm_node = None
+        for node_idx in pattern_nodes:
+            node = model.graph.node[node_idx]
+            if node.op_type in ["InstanceNormalization", "GroupNormalization"]:
+                norm_node = node
                 break
+        
+        if not norm_node:
+            print(f"Warning: Could not find normalization node in pattern {pattern_nodes}")
+            continue
+            
+        print(f"Replacing complex pattern with {len(pattern_nodes)} nodes: {[model.graph.node[idx].name for idx in pattern_nodes]}")
+        print(f"  Input: {input_tensor} -> Output: {output_tensor}")
+        
+        # Create new normalization that preserves the original channel grouping
+        # Get the channel dimension from the first reshape in the pattern
+        first_reshape_idx = pattern_nodes[0]
+        first_reshape_node = model.graph.node[first_reshape_idx]
+        first_reshape_shape_input = first_reshape_node.input[1]
+        
+        # Get the target channels from the first reshape
+        target_channels = None
+        for init in model.graph.initializer:
+            if init.name == first_reshape_shape_input:
+                shape_array = numpy_helper.to_array(init)
+                if len(shape_array) == 3:  # [0, channels, -1]
+                    target_channels = shape_array[1]
+                break
+        
+        if target_channels:
+            # Create intermediate reshape to match the channel dimension of the normalization
+            # Input: [1, 512, 32, 32] -> [1, 32, 32, -1] (preserving spatial as 4D)
+            # Let ONNX calculate the last dimension automatically to preserve total elements
+            
+            intermediate_shape = np.array([0, int(target_channels), 32, -1], dtype=np.int64)
+            intermediate_shape_name = f"{norm_node.name}_intermediate_shape"
+            intermediate_shape_init = numpy_helper.from_array(intermediate_shape, intermediate_shape_name)
+            
+            # Add the intermediate shape to initializers
+            model.graph.initializer.append(intermediate_shape_init)
+            
+            # First reshape: input -> intermediate 4D with correct channels
+            intermediate_reshape = helper.make_node(
+                "Reshape",
+                inputs=[input_tensor, intermediate_shape_name],
+                outputs=[f"{norm_node.name}_intermediate_4d"],
+                name=f"{norm_node.name}_intermediate_reshape"
+            )
+            
+            # Create the appropriate 4D normalization node
+            if norm_type == "InstanceNormalization":
+                new_norm_node = helper.make_node(
+                    "InstanceNormalization",
+                    inputs=[f"{norm_node.name}_intermediate_4d"] + norm_node.input[1:],
+                    outputs=[f"{norm_node.name}_coreml_4d_output"],
+                    name=f"{norm_node.name}_coreml_4d"
+                )
+            elif norm_type == "GroupNormalization":
+                new_norm_node = helper.make_node(
+                    "GroupNormalization",
+                    inputs=[f"{norm_node.name}_intermediate_4d"] + norm_node.input[1:],
+                    outputs=[f"{norm_node.name}_coreml_4d_output"],
+                    name=f"{norm_node.name}_coreml_4d"
+                )
+            
+            # Copy attributes from original normalization node
+            for attr in norm_node.attribute:
+                new_norm_node.attribute.append(attr)
+            
+            new_nodes.extend([intermediate_reshape, new_norm_node])
+        else:
+            # Fallback: direct 4D normalization (shouldn't happen)
+            if norm_type == "InstanceNormalization":
+                new_norm_node = helper.make_node(
+                    "InstanceNormalization",
+                    inputs=[input_tensor] + norm_node.input[1:],
+                    outputs=[f"{norm_node.name}_coreml_4d_output"],
+                    name=f"{norm_node.name}_coreml_4d"
+                )
+            elif norm_type == "GroupNormalization":
+                new_norm_node = helper.make_node(
+                    "GroupNormalization",
+                    inputs=[input_tensor] + norm_node.input[1:],
+                    outputs=[f"{norm_node.name}_coreml_4d_output"],
+                    name=f"{norm_node.name}_coreml_4d"
+                )
+            
+            for attr in norm_node.attribute:
+                new_norm_node.attribute.append(attr)
+            new_nodes.append(new_norm_node)
+        
+        # Add final reshape to match the original pattern's output shape
+        final_shape_input = None
+        if len(pattern_nodes) >= 3:  # Should have: [first_reshape, norm, second_reshape]
+            second_reshape_idx = pattern_nodes[2]
+            second_reshape_node = model.graph.node[second_reshape_idx]
+            if second_reshape_node.op_type == "Reshape":
+                final_shape_input = second_reshape_node.input[1]  # Get the target shape
+        
+        if final_shape_input:
+            # Add a reshape to match the original pattern's final output shape
+            final_reshape = helper.make_node(
+                "Reshape",
+                inputs=[f"{norm_node.name}_coreml_4d_output", final_shape_input],
+                outputs=[output_tensor],
+                name=f"{norm_node.name}_final_reshape"
+            )
+            new_nodes.append(final_reshape)
+        else:
+            # No final reshape needed - update the last normalization node to output directly
+            if new_nodes:
+                new_nodes[-1].output[0] = output_tensor
+        
+        # Mark all nodes in the pattern for removal
+        for node_idx in pattern_nodes:
+            nodes_to_remove.add(node_idx)
+        
+        print(f"  Replaced with direct 4D {norm_type}")
     
-    print(f"Applied {applied_modifications} shape modifications")
-    
-    # Third pass: Update value_info to reflect new shapes
-    updated_value_infos = 0
-    for value_info in model.graph.value_info:
-        if value_info.name in all_tensor_shapes:
-            shape = all_tensor_shapes[value_info.name]
-            if len([d for d in shape if d > 16384]) == 0:  # No more problematic dimensions
-                # Update the value_info with the new shape
-                tensor_type = value_info.type.tensor_type
-                tensor_type.ClearField('shape')
-                shape_proto = tensor_type.shape
-                for dim_val in shape:
-                    dim = shape_proto.dim.add()
-                    if dim_val > 0:
-                        dim.dim_value = dim_val
-                    # For dynamic dimensions (-1), leave dim_value unset
-                updated_value_infos += 1
-    
-    print(f"Updated {updated_value_infos} value_info entries")
-    
-    # Final check for remaining problematic tensors
-    remaining_problematic = 0
-    for tensor_name in problematic_tensors:
-        if tensor_name in all_tensor_shapes:
-            shape = all_tensor_shapes[tensor_name]
-            if len([d for d in shape if d > 16384]) > 0:
-                remaining_problematic += 1
-                print(f"⚠ Still problematic: {tensor_name} with shape {shape}")
-    
-    if remaining_problematic == 0:
-        print("✓ All problematic tensors have been resolved!")
+    # Apply the replacements
+    if new_nodes:
+        # First, collect all intermediate tensor names that will be replaced
+        tensor_replacements = {}  # old_tensor_name -> new_tensor_name
+        
+        # Collect tensor names before we modify anything
+        original_nodes = list(model.graph.node)
+        for pattern_nodes, norm_type, input_tensor, output_tensor in problematic_patterns:
+            # Map all intermediate tensors in the pattern to the final output tensor
+            for node_idx in pattern_nodes:
+                if node_idx < len(original_nodes):
+                    node = original_nodes[node_idx]
+                    for output_name in node.output:
+                        if output_name != output_tensor:  # Don't replace the final output with itself
+                            tensor_replacements[output_name] = output_tensor
+        
+        print(f"Tensor replacements: {len(tensor_replacements)} mappings")
+        
+        # Update ALL nodes in the graph to use the new tensor names
+        updated_inputs = 0
+        updated_outputs = 0
+        
+        for node in model.graph.node:
+            # Update input references
+            new_inputs = []
+            for input_name in node.input:
+                if input_name in tensor_replacements:
+                    new_inputs.append(tensor_replacements[input_name])
+                    updated_inputs += 1
+                else:
+                    new_inputs.append(input_name)
+            node.input[:] = new_inputs
+            
+            # Update output references (though this should be rare)
+            new_outputs = []
+            for output_name in node.output:
+                if output_name in tensor_replacements:
+                    new_outputs.append(tensor_replacements[output_name])
+                    updated_outputs += 1
+                else:
+                    new_outputs.append(output_name)
+            node.output[:] = new_outputs
+        
+        print(f"Updated {updated_inputs} input references and {updated_outputs} output references")
+        
+        # Now create new node list without removed nodes
+        new_node_list = []
+        for i, node in enumerate(model.graph.node):
+            if i not in nodes_to_remove:
+                new_node_list.append(node)
+        
+        # Add the new nodes
+        new_node_list.extend(new_nodes)
+        
+        # Replace the graph nodes
+        del model.graph.node[:]
+        model.graph.node.extend(new_node_list)
+        
+        print(f"Successfully replaced {len(problematic_patterns)} normalization patterns")
+        
+        # Clean up value_info for removed intermediate tensors
+        removed_tensors = set(tensor_replacements.keys())
+        
+        new_value_info = []
+        for value_info in model.graph.value_info:
+            if value_info.name not in removed_tensors:
+                new_value_info.append(value_info)
+        
+        del model.graph.value_info[:]
+        model.graph.value_info.extend(new_value_info)
+        
+        print(f"Cleaned up {len(removed_tensors)} intermediate tensor references")
     else:
-        print(f"⚠ {remaining_problematic} problematic tensors remain")
+        print("No patterns replaced - normalization operations may still have large intermediate dimensions")
     
-    print("Comprehensive CoreML compatibility transformations completed.")
+    print("CoreML compatibility transformations completed.")
     return model
-
-def decompose_large_dimensions(target_shape):
-    """
-    Helper function to decompose large dimensions into smaller ones.
-    """
-    import math
-    
-    new_shape = list(target_shape)
-    
-    for i, dim in enumerate(target_shape):
-        if dim > 16384:
-            # Handle specific common cases first
-            if dim == 262144:  # 512 * 512
-                new_shape = new_shape[:i] + [512, 512] + new_shape[i+1:]
-                break
-            elif dim == 131072:  # 256 * 512  
-                new_shape = new_shape[:i] + [256, 512] + new_shape[i+1:]
-                break
-            elif dim == 65536:  # 256 * 256
-                new_shape = new_shape[:i] + [256, 256] + new_shape[i+1:]
-                break
-            elif dim == 524288:  # 512 * 1024
-                new_shape = new_shape[:i] + [512, 1024] + new_shape[i+1:]
-                break
-            elif dim == 32768:  # 128 * 256
-                new_shape = new_shape[:i] + [128, 256] + new_shape[i+1:]
-                break
-            elif dim == 30720:  # 120 * 256
-                new_shape = new_shape[:i] + [120, 256] + new_shape[i+1:]
-                break
-            elif dim == 20480:  # 80 * 256
-                new_shape = new_shape[:i] + [80, 256] + new_shape[i+1:]
-                break
-            else:
-                # Try to find a good factorization
-                # First try perfect squares
-                sqrt_dim = int(math.sqrt(dim))
-                if sqrt_dim * sqrt_dim == dim and sqrt_dim <= 512:
-                    new_shape = new_shape[:i] + [sqrt_dim, sqrt_dim] + new_shape[i+1:]
-                    break
-                
-                # Try other factorizations
-                factors = [64, 128, 256, 512]
-                factorized = False
-                for factor in factors:
-                    if dim % factor == 0:
-                        other_factor = dim // factor
-                        if other_factor <= 16384:
-                            new_shape = new_shape[:i] + [factor, other_factor] + new_shape[i+1:]
-                            factorized = True
-                            break
-                
-                if factorized:
-                    break
-                else:
-                    # As a last resort, try to split into two factors as evenly as possible
-                    mid = int(math.sqrt(dim))
-                    while mid > 1:
-                        if dim % mid == 0:
-                            other = dim // mid
-                            if mid <= 16384 and other <= 16384:
-                                new_shape = new_shape[:i] + [mid, other] + new_shape[i+1:]
-                                break
-                        mid -= 1
-                    break
-    
-    return np.array(new_shape, dtype=target_shape.dtype)
 
 def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_version=18):
     """Export VAE encoder to ONNX"""
