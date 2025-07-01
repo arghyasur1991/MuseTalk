@@ -257,11 +257,24 @@ def export_unet_to_onnx(unet, output_path, device='cpu', opset_version=18, use_t
 
         tune_model(output_path, "unet", fp16=False)
         
-        # [DON'T UNCOMMENT] Apply post-processing optimizations [doesn't work so commented out]
-        # model = onnx.load(output_path)
-        # model = patch_pow_constants(model)
-        # model_simp, check = simplify(model)
-        # onnx.save(model_simp, output_path)
+        # Apply CoreML compatibility transformations only (without problematic post-processing)
+        model = onnx.load(output_path, load_external_data=True)
+        model = make_coreml_compatible(model)
+
+        data_location = f"{output_path}.data"
+        if os.path.exists(data_location):
+            print(f"Removing {data_location}")
+            os.remove(data_location)
+        
+        # Save with external data format (required for large UNet model)
+        onnx.save_model(
+            model, 
+            output_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=f"{os.path.basename(output_path)}.data",
+            size_threshold=1024
+        )
             
         print(f"UNet exported successfully with external data")
         
@@ -341,57 +354,143 @@ def make_coreml_compatible(model):
     
     print("Applying CoreML compatibility transformations...")
     
+    # Add comprehensive debugging
+    print(f"Total nodes in model: {len(model.graph.node)}")
+    
+    # Count node types
+    node_types = {}
+    reshape_nodes = []
+    norm_nodes = []
+    
+    for i, node in enumerate(model.graph.node):
+        node_type = node.op_type
+        node_types[node_type] = node_types.get(node_type, 0) + 1
+        
+        if node_type == "Reshape":
+            reshape_nodes.append((i, node.name))
+        elif node_type in ["InstanceNormalization", "GroupNormalization"]:
+            norm_nodes.append((i, node.name, node_type))
+    
+    print(f"Node type counts: {dict(sorted(node_types.items()))}")
+    print(f"Found {len(reshape_nodes)} Reshape nodes: {[name for _, name in reshape_nodes[:5]]}{'...' if len(reshape_nodes) > 5 else ''}")
+    print(f"Found {len(norm_nodes)} Normalization nodes: {[(name, ntype) for _, name, ntype in norm_nodes[:5]]}{'...' if len(norm_nodes) > 5 else ''}")
+    
+    # Check reshape shapes in detail
+    print("\nAnalyzing Reshape nodes:")
+    for i, (idx, name) in enumerate(reshape_nodes[:10]):  # Check first 10
+        node = model.graph.node[idx]
+        if len(node.input) > 1:
+            shape_input = node.input[1]
+            target_shape = None
+            
+            # First check static initializers (VAE case)
+            for init in model.graph.initializer:
+                if init.name == shape_input:
+                    target_shape = numpy_helper.to_array(init)
+                    break
+            
+            # If not found in initializers, check Constant nodes (UNet case)
+            if target_shape is None:
+                for const_node in model.graph.node:
+                    if const_node.op_type == "Constant" and len(const_node.output) > 0 and const_node.output[0] == shape_input:
+                        # Found the constant node that provides the shape
+                        for attr in const_node.attribute:
+                            if attr.name == "value":
+                                target_shape = numpy_helper.to_array(attr.t)
+                                break
+                        break
+            
+            # Look for [0, channels, -1] pattern that creates large last dimension
+            if target_shape is not None and len(target_shape) == 3 and target_shape[2] == -1:
+                print(f"Found potential problematic reshape at {node.name}: shape {target_shape}")
+            
+            print(f"  {name}: shape_input={shape_input}, target_shape={target_shape}")
+        else:
+            print(f"  {name}: No shape input found")
+    
     # Find problematic patterns: Reshape[4D→3D] -> Normalization -> [Mul/Add operations] -> Reshape[3D→4D]
     problematic_patterns = []
     
-    for i in range(len(model.graph.node) - 2):
-        node1 = model.graph.node[i]
+    print("\nScanning for problematic normalization patterns...")
+    
+    for i in range(len(model.graph.node)):
+        node = model.graph.node[i]
         
-        # Look for initial Reshape that creates 3D tensor
-        if node1.op_type == "Reshape":
+        # Look for any Reshape that creates 3D tensor with potential large dimensions
+        if node.op_type == "Reshape":
             # Check if this reshape creates 3D tensor with potential large dimensions
-            shape_input = node1.input[1] if len(node1.input) > 1 else None
+            shape_input = node.input[1] if len(node.input) > 1 else None
             if shape_input:
+                target_shape = None
+                
+                # First check static initializers (VAE case)
                 for init in model.graph.initializer:
                     if init.name == shape_input:
                         target_shape = numpy_helper.to_array(init)
-                        # Look for [0, channels, -1] pattern that creates large last dimension
-                        if len(target_shape) == 3 and target_shape[2] == -1:
-                            # Found problematic initial reshape, now look for the complete pattern
-                            pattern_nodes = [i]  # Start with the reshape
-                            current_output = node1.output[0]
-                            pattern_found = False
-                            final_reshape_idx = None
-                            norm_type = None
-                            
-                            # Trace through the graph to find the core Reshape->Norm->Reshape pattern
-                            for j in range(i + 1, min(i + 4, len(model.graph.node))):  # Look ahead up to 3 nodes
-                                candidate_node = model.graph.node[j]
-                                
-                                # Check if this node uses the current output tensor
-                                if current_output in candidate_node.input:
-                                    pattern_nodes.append(j)
-                                    
-                                    # Check if this is a normalization node
-                                    if candidate_node.op_type in ["InstanceNormalization", "GroupNormalization"]:
-                                        norm_type = candidate_node.op_type
-                                        current_output = candidate_node.output[0]
-                                    # Check if this is the second reshape (after normalization)
-                                    elif candidate_node.op_type == "Reshape" and norm_type:
-                                        final_reshape_idx = j
-                                        pattern_found = True
-                                        break
-                                    else:
-                                        # Not part of our core pattern
-                                        break
-                            
-                            if pattern_found and norm_type and final_reshape_idx:
-                                print(f"Found complex normalization pattern starting at {node1.name}")
-                                print(f"  Pattern nodes: {[model.graph.node[idx].name for idx in pattern_nodes]}")
-                                print(f"  Normalization type: {norm_type}")
-                                print(f"  Reshape shape: {target_shape}")
-                                problematic_patterns.append((pattern_nodes, norm_type, node1.input[0], model.graph.node[final_reshape_idx].output[0]))
                         break
+                
+                # If not found in initializers, check Constant nodes (UNet case)
+                if target_shape is None:
+                    for const_node in model.graph.node:
+                        if const_node.op_type == "Constant" and len(const_node.output) > 0 and const_node.output[0] == shape_input:
+                            # Found the constant node that provides the shape
+                            for attr in const_node.attribute:
+                                if attr.name == "value":
+                                    target_shape = numpy_helper.to_array(attr.t)
+                                    break
+                            break
+                
+                # Look for [0, channels, -1] pattern that creates large last dimension
+                if target_shape is not None and len(target_shape) == 3 and target_shape[2] == -1:
+                    print(f"Found potential problematic reshape at {node.name}: shape {target_shape}")
+                    
+                    # Now look for the normalization pattern following this reshape
+                    reshape_output = node.output[0]
+                    pattern_nodes = [i]  # Start with this reshape
+                    norm_type = None
+                    final_reshape_idx = None
+                    
+                    # Look for normalization node that uses this reshape's output
+                    for j in range(len(model.graph.node)):
+                        if j == i:  # Skip the current reshape
+                            continue
+                            
+                        candidate_node = model.graph.node[j]
+                        
+                        # Check if this node uses the reshape output
+                        if reshape_output in candidate_node.input:
+                            print(f"  Found node {candidate_node.name} using reshape output")
+                            
+                            # Check if this is a normalization node
+                            if candidate_node.op_type in ["InstanceNormalization", "GroupNormalization"]:
+                                print(f"  Found normalization: {candidate_node.op_type}")
+                                norm_type = candidate_node.op_type
+                                pattern_nodes.append(j)
+                                norm_output = candidate_node.output[0]
+                                
+                                # Now look for a reshape that uses the normalization output
+                                for k in range(len(model.graph.node)):
+                                    if k == i or k == j:  # Skip already processed nodes
+                                        continue
+                                    
+                                    final_candidate = model.graph.node[k]
+                                    if final_candidate.op_type == "Reshape" and norm_output in final_candidate.input:
+                                        print(f"  Found final reshape: {final_candidate.name}")
+                                        pattern_nodes.append(k)
+                                        final_reshape_idx = k
+                                        break
+                                
+                                break  # Found normalization, don't look for more
+                    
+                    if norm_type and final_reshape_idx is not None:
+                        print(f"Complete pattern found: {[model.graph.node[idx].name for idx in pattern_nodes]}")
+                        problematic_patterns.append((pattern_nodes, norm_type, node.input[0], model.graph.node[final_reshape_idx].output[0]))
+                    else:
+                        print(f"Incomplete pattern - norm_type: {norm_type}, final_reshape_idx: {final_reshape_idx}")
+                elif target_shape is not None:
+                    print(f"Reshape {node.name} has shape {target_shape} but doesn't match [0, channels, -1] pattern")
+                else:
+                    print(f"Reshape {node.name} has no detectable target_shape")
     
     print(f"Found {len(problematic_patterns)} problematic normalization patterns")
     
@@ -423,12 +522,27 @@ def make_coreml_compatible(model):
         
         # Get the target channels from the first reshape
         target_channels = None
+        
+        # First check static initializers (VAE case)
         for init in model.graph.initializer:
             if init.name == first_reshape_shape_input:
                 shape_array = numpy_helper.to_array(init)
                 if len(shape_array) == 3:  # [0, channels, -1]
                     target_channels = shape_array[1]
                 break
+        
+        # If not found in initializers, check Constant nodes (UNet case)
+        if target_channels is None:
+            for const_node in model.graph.node:
+                if const_node.op_type == "Constant" and len(const_node.output) > 0 and const_node.output[0] == first_reshape_shape_input:
+                    # Found the constant node that provides the shape
+                    for attr in const_node.attribute:
+                        if attr.name == "value":
+                            shape_array = numpy_helper.to_array(attr.t)
+                            if len(shape_array) == 3:  # [0, channels, -1]
+                                target_channels = shape_array[1]
+                            break
+                    break
         
         if target_channels:
             # Create intermediate reshape to match the channel dimension of the normalization
