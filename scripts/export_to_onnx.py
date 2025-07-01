@@ -329,6 +329,241 @@ def patch_pow_constants(model):
 
     return model
 
+def make_coreml_compatible(model):
+    """
+    Make ONNX model compatible with CoreML by addressing input dimension > 16384 issues.
+    CoreML has a limitation where input dimensions cannot exceed 16384.
+    This function comprehensively handles the tensor flow through the graph.
+    """
+    import onnx
+    from onnx import helper, numpy_helper, TensorProto
+    import numpy as np
+    
+    print("Applying comprehensive CoreML compatibility transformations...")
+    
+    # Keep track of all problematic tensor shapes
+    problematic_tensors = set()
+    
+    # First pass: identify all tensors with problematic shapes
+    all_tensor_shapes = {}
+    
+    # Extract shapes from all sources
+    for value_info in model.graph.value_info:
+        if value_info.type.tensor_type.shape:
+            shape = []
+            for dim in value_info.type.tensor_type.shape.dim:
+                if dim.dim_value > 0:
+                    shape.append(dim.dim_value)
+                else:
+                    shape.append(-1)
+            all_tensor_shapes[value_info.name] = shape
+            # Check if this tensor has problematic dimensions
+            if len(shape) >= 3 and len([d for d in shape if d > 16384]) > 0:
+                problematic_tensors.add(value_info.name)
+                print(f"Found problematic tensor: {value_info.name} with shape {shape}")
+    
+    # Also check inputs and outputs
+    for input_info in model.graph.input:
+        if input_info.type.tensor_type.shape:
+            shape = []
+            for dim in input_info.type.tensor_type.shape.dim:
+                if dim.dim_value > 0:
+                    shape.append(dim.dim_value)
+                else:
+                    shape.append(-1)
+            all_tensor_shapes[input_info.name] = shape
+    
+    for output_info in model.graph.output:
+        if output_info.type.tensor_type.shape:
+            shape = []
+            for dim in output_info.type.tensor_type.shape.dim:
+                if dim.dim_value > 0:
+                    shape.append(dim.dim_value)
+                else:
+                    shape.append(-1)
+            all_tensor_shapes[output_info.name] = shape
+    
+    print(f"Found {len(problematic_tensors)} problematic tensors out of {len(all_tensor_shapes)} total tensors")
+    
+    # Debug: List all problematic tensor names
+    if problematic_tensors:
+        print("Problematic tensor names:")
+        for tensor_name in sorted(problematic_tensors):
+            print(f"  - {tensor_name}: {all_tensor_shapes[tensor_name]}")
+    
+    # Second pass: modify Reshape operations that create problematic shapes
+    new_initializers = []
+    additional_nodes = []
+    nodes_to_modify = []
+    reshapes_modified = 0
+    
+    for i, node in enumerate(model.graph.node):
+        if node.op_type == "Reshape":
+            output_name = node.output[0]
+            shape_input = node.input[1]
+            
+            # Check if this reshape creates a problematic output
+            if output_name in problematic_tensors or (output_name in all_tensor_shapes and 
+                len([d for d in all_tensor_shapes[output_name] if d > 16384]) > 0):
+                
+                print(f"Processing problematic Reshape node: {node.name or f'reshape_{i}'}")
+                print(f"  Output tensor: {output_name}")
+                
+                # Find the target shape
+                target_shape = None
+                shape_initializer = None
+                for init in model.graph.initializer:
+                    if init.name == shape_input:
+                        target_shape = numpy_helper.to_array(init)
+                        shape_initializer = init
+                        break
+                
+                if target_shape is not None:
+                    print(f"  Original target shape: {target_shape}")
+                    
+                    # Create a modified shape that breaks down large dimensions
+                    new_shape = decompose_large_dimensions(target_shape)
+                    
+                    if not np.array_equal(new_shape, target_shape):
+                        print(f"  New target shape: {new_shape}")
+                        reshapes_modified += 1
+                        
+                        # Update the shape initializer
+                        new_shape_array = np.array(new_shape, dtype=target_shape.dtype)
+                        new_shape_init = numpy_helper.from_array(new_shape_array, shape_input)
+                        new_initializers.append((shape_input, new_shape_init))
+                        
+                        # Update the tensor shape tracking
+                        all_tensor_shapes[output_name] = list(new_shape)
+                        
+                        # Remove from problematic tensors if fixed
+                        if len([d for d in new_shape if d > 16384]) == 0:
+                            problematic_tensors.discard(output_name)
+                            print(f"  ✓ Fixed tensor {output_name}")
+                        else:
+                            print(f"  ⚠ Tensor {output_name} still has large dimensions")
+                    else:
+                        print(f"  No modification needed for {output_name}")
+                else:
+                    print(f"  Could not find shape initializer for {shape_input}")
+    
+    print(f"Modified {reshapes_modified} Reshape operations")
+    
+    # Apply the shape modifications
+    applied_modifications = 0
+    for shape_name, new_init in new_initializers:
+        for j, init in enumerate(model.graph.initializer):
+            if init.name == shape_name:
+                model.graph.initializer[j].CopyFrom(new_init)
+                applied_modifications += 1
+                print(f"Updated initializer {shape_name}")
+                break
+    
+    print(f"Applied {applied_modifications} shape modifications")
+    
+    # Third pass: Update value_info to reflect new shapes
+    updated_value_infos = 0
+    for value_info in model.graph.value_info:
+        if value_info.name in all_tensor_shapes:
+            shape = all_tensor_shapes[value_info.name]
+            if len([d for d in shape if d > 16384]) == 0:  # No more problematic dimensions
+                # Update the value_info with the new shape
+                tensor_type = value_info.type.tensor_type
+                tensor_type.ClearField('shape')
+                shape_proto = tensor_type.shape
+                for dim_val in shape:
+                    dim = shape_proto.dim.add()
+                    if dim_val > 0:
+                        dim.dim_value = dim_val
+                    # For dynamic dimensions (-1), leave dim_value unset
+                updated_value_infos += 1
+    
+    print(f"Updated {updated_value_infos} value_info entries")
+    
+    # Final check for remaining problematic tensors
+    remaining_problematic = 0
+    for tensor_name in problematic_tensors:
+        if tensor_name in all_tensor_shapes:
+            shape = all_tensor_shapes[tensor_name]
+            if len([d for d in shape if d > 16384]) > 0:
+                remaining_problematic += 1
+                print(f"⚠ Still problematic: {tensor_name} with shape {shape}")
+    
+    if remaining_problematic == 0:
+        print("✓ All problematic tensors have been resolved!")
+    else:
+        print(f"⚠ {remaining_problematic} problematic tensors remain")
+    
+    print("Comprehensive CoreML compatibility transformations completed.")
+    return model
+
+def decompose_large_dimensions(target_shape):
+    """
+    Helper function to decompose large dimensions into smaller ones.
+    """
+    import math
+    
+    new_shape = list(target_shape)
+    
+    for i, dim in enumerate(target_shape):
+        if dim > 16384:
+            # Handle specific common cases first
+            if dim == 262144:  # 512 * 512
+                new_shape = new_shape[:i] + [512, 512] + new_shape[i+1:]
+                break
+            elif dim == 131072:  # 256 * 512  
+                new_shape = new_shape[:i] + [256, 512] + new_shape[i+1:]
+                break
+            elif dim == 65536:  # 256 * 256
+                new_shape = new_shape[:i] + [256, 256] + new_shape[i+1:]
+                break
+            elif dim == 524288:  # 512 * 1024
+                new_shape = new_shape[:i] + [512, 1024] + new_shape[i+1:]
+                break
+            elif dim == 32768:  # 128 * 256
+                new_shape = new_shape[:i] + [128, 256] + new_shape[i+1:]
+                break
+            elif dim == 30720:  # 120 * 256
+                new_shape = new_shape[:i] + [120, 256] + new_shape[i+1:]
+                break
+            elif dim == 20480:  # 80 * 256
+                new_shape = new_shape[:i] + [80, 256] + new_shape[i+1:]
+                break
+            else:
+                # Try to find a good factorization
+                # First try perfect squares
+                sqrt_dim = int(math.sqrt(dim))
+                if sqrt_dim * sqrt_dim == dim and sqrt_dim <= 512:
+                    new_shape = new_shape[:i] + [sqrt_dim, sqrt_dim] + new_shape[i+1:]
+                    break
+                
+                # Try other factorizations
+                factors = [64, 128, 256, 512]
+                factorized = False
+                for factor in factors:
+                    if dim % factor == 0:
+                        other_factor = dim // factor
+                        if other_factor <= 16384:
+                            new_shape = new_shape[:i] + [factor, other_factor] + new_shape[i+1:]
+                            factorized = True
+                            break
+                
+                if factorized:
+                    break
+                else:
+                    # As a last resort, try to split into two factors as evenly as possible
+                    mid = int(math.sqrt(dim))
+                    while mid > 1:
+                        if dim % mid == 0:
+                            other = dim // mid
+                            if mid <= 16384 and other <= 16384:
+                                new_shape = new_shape[:i] + [mid, other] + new_shape[i+1:]
+                                break
+                        mid -= 1
+                    break
+    
+    return np.array(new_shape, dtype=target_shape.dtype)
+
 def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_version=18):
     """Export VAE encoder to ONNX"""
     print(f"Exporting VAE Encoder to {output_path} with opset {opset_version}")
@@ -380,7 +615,13 @@ def export_vae_encoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     # Apply post-processing optimizations
     model = onnx.load(output_path)
     model_simp, check = simplify(model)
+    
+    # Apply CoreML compatibility transformations
+    model_simp = make_coreml_compatible(model_simp)
+    
     onnx.save(model_simp, output_path)
+
+    
     
     # Export to ONNX with dynamic axes for height and width
     # torch.onnx.export(
@@ -455,6 +696,10 @@ def export_vae_decoder_to_onnx(vae_model, output_path, device="cpu", opset_versi
     # Apply post-processing optimizations
     model = onnx.load(output_path)
     model_simp, check = simplify(model)
+    
+    # Apply CoreML compatibility transformations
+    model_simp = make_coreml_compatible(model_simp)
+    
     onnx.save(model_simp, output_path)
     
     print(f"VAE Decoder exported successfully to {output_path}")
