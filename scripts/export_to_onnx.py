@@ -709,6 +709,66 @@ def make_coreml_compatible(model):
     else:
         print("No patterns replaced - normalization operations may still have large intermediate dimensions")
     
+    # Clean up unused nodes (Constant nodes, etc.) that are no longer referenced
+    if problematic_patterns:
+        print("Cleaning up unused nodes...")
+        
+        # Collect all tensor names that are currently used
+        used_tensor_names = set()
+        
+        # Add input names
+        for input_info in model.graph.input:
+            used_tensor_names.add(input_info.name)
+        
+        # Add output names
+        for output_info in model.graph.output:
+            used_tensor_names.add(output_info.name)
+        
+        # Add all tensor names used by remaining nodes
+        for node in model.graph.node:
+            for input_name in node.input:
+                if input_name:  # Skip empty strings
+                    used_tensor_names.add(input_name)
+            for output_name in node.output:
+                if output_name:  # Skip empty strings
+                    used_tensor_names.add(output_name)
+        
+        # Find unused nodes (especially Constant nodes)
+        unused_nodes = []
+        for i, node in enumerate(model.graph.node):
+            node_outputs_used = any(output_name in used_tensor_names for output_name in node.output if output_name)
+            if not node_outputs_used:
+                unused_nodes.append(i)
+        
+        # Remove unused nodes
+        if unused_nodes:
+            remaining_nodes = []
+            for i, node in enumerate(model.graph.node):
+                if i not in unused_nodes:
+                    remaining_nodes.append(node)
+            
+            del model.graph.node[:]
+            model.graph.node.extend(remaining_nodes)
+            
+            print(f"Removed {len(unused_nodes)} unused nodes")
+        
+        # Clean up unused initializers
+        unused_initializers = []
+        for i, init in enumerate(model.graph.initializer):
+            if init.name not in used_tensor_names:
+                unused_initializers.append(i)
+        
+        if unused_initializers:
+            remaining_initializers = []
+            for i, init in enumerate(model.graph.initializer):
+                if i not in unused_initializers:
+                    remaining_initializers.append(init)
+            
+            del model.graph.initializer[:]
+            model.graph.initializer.extend(remaining_initializers)
+            
+            print(f"Removed {len(unused_initializers)} unused initializers")
+    
     print("CoreML compatibility transformations completed.")
     return model
 
